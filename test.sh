@@ -145,10 +145,11 @@ EOF
     fi
 }
 
+# Функция 3: Device Guard (Remnanode → Telegram Bot)
 setup_device_guard() {
     log "=== 3. Device Guard (Remnanode → Telegram Bot) ==="
     
-    # Цвета (исправленные экранирования для heredoc)
+    # Цвета (ПРАВИЛЬНЫЙ синтаксис)
     local RED=$'\033[0;31m'
     local GREEN=$'\033[0;32m'
     local YELLOW=$'\033[1;33m'
@@ -221,13 +222,65 @@ setup_device_guard() {
     print_success "Директория создана: $INSTALL_DIR"
     echo ""
     
-    # Шаг 2-7: Остальная логика (создание скрипта, cron и т.д.) - сокращенно
+    # Создание полного скрипта report.sh
     cat > "$SCRIPT_PATH" << 'EOFSCRIPT'
 #!/bin/bash
-WEBHOOKS=("https://DOMAIN_PLACEHOLDER/device-report|SECRET_PLACEHOLDER")
+WEBHOOKS=(
+  "https://DOMAIN_PLACEHOLDER/device-report|SECRET_PLACEHOLDER"
+)
 TIME_WINDOW=TIME_WINDOW_PLACEHOLDER
 LOG_FILE="LOG_FILE_PLACEHOLDER"
-# ... (полный awk парсер из оригинала)
+
+DATA=$(tail -n 10000 "$LOG_FILE" 2>/dev/null | \
+  awk -v window="$TIME_WINDOW" '
+  /email:/ {
+    split($1, d, "/")
+    split($2, t, ":")
+    split(t[3], sec, ".")
+    ts = mktime(d[1] " " d[2] " " d[3] " " t[1] " " t[2] " " sec[1])
+    match($0, /from ([0-9.]+):/, iparr)
+    match($0, /email: ([0-9]+)/, emarr)
+    if(iparr[1] && emarr[1]) {
+      n = ++total
+      all_ts[n] = ts
+      all_ip[n] = iparr[1]
+      all_em[n] = emarr[1]
+      if (ts > global_max) global_max = ts
+    }
+  }
+  END {
+    threshold = global_max - window
+    for (i = 1; i <= total; i++) {
+      if (all_ts[i] >= threshold) {
+        em = all_em[i]
+        ip = all_ip[i]
+        key = em SUBSEP ip
+        if (!(key in seen)) {
+          seen[key] = 1
+          users[em] = users[em] ? users[em] ",\"" ip "\"" : "\"" ip "\""
+        }
+      }
+    }
+    printf "{\"ts\":%d,\"users\":{", systime()
+    first = 1
+    for (em in users) {
+      if (!first) printf ","
+      printf "\"%s\":[%s]", em, users[em]
+      first = 0
+    }
+    print "}}"
+  }')
+
+for entry in "${WEBHOOKS[@]}"; do
+  URL="${entry%%|*}"
+  KEY="${entry##*|}"
+  echo "$DATA" | curl -s -X POST "$URL" \
+    -H "Content-Type: application/json" \
+    -H "X-Api-Key: $KEY" \
+    -d @- > /dev/null 2>&1 &
+done
+
+wait
 EOFSCRIPT
     
     # Замены плейсхолдеров
@@ -266,14 +319,14 @@ main_menu() {
         echo ""
         echo "1) Отключить IPv6 навсегда"
         echo "2) Certbot + Nginx SSL (Caddy → Nginx)"
-		echo "3) Device Guard (Remnanode → Telegram Bot)"
+        echo "3) Device Guard (Remnanode → Telegram Bot)"
         echo "0) Выход"
         read -p "Выбор: " choice
         
         case $choice in
             1) disable_ipv6 ;;
             2) setup_certbot_nginx ;;
-			3) setup_device_guard ;;
+            3) setup_device_guard ;;
             0) log "Пока!"; exit 0 ;;
             *) log "❌ Неверный пункт" ;;
         esac
