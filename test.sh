@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -euo pipefail  # Выход при ошибке, неиспользуемые переменные, pipefail
-
 LOG_FILE="/var/log/setup-combine.log"
 exec > >(tee -a "$LOG_FILE") 2>&1  # Логи в файл + консоль
 
@@ -335,3 +333,4 @@ main_menu() {
 }
 
 main_menu "$@"
+
