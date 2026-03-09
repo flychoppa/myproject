@@ -1,110 +1,149 @@
 #!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
 LOG_FILE="/var/log/setup-combine.log"
-exec > >(tee -a "$LOG_FILE") 2>&1  # Логи в файл + консоль
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+trap 'log "❌ Ошибка на строке $LINENO: команда завершилась с кодом $?"' ERR
 
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
         log "❌ Запускай от root: sudo ./setup.sh"
         exit 1
+    fi
+}
+
+require_cmd() {
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        log "❌ Не найдена команда: $cmd"
+        return 1
+    fi
+}
+
+backup_file() {
+    local file="$1"
+    local backup="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp -a "$file" "$backup"
+    echo "$backup"
+}
+
+append_grub_param() {
+    local file="$1"
+    local key="$2"
+    local param="$3"
+
+    if grep -Eq "^${key}=" "$file"; then
+        if grep -Eq "^${key}=\"[^\"]*(^|[[:space:]])${param}([[:space:]]|$)" "$file"; then
+            return 0
+        fi
+        sed -i -E "s|^(${key}=\")([^\"]*)\"|\\1\\2 ${param}\"|" "$file"
+    else
+        echo "${key}=\"${param}\"" >> "$file"
     fi
 }
 
 # Функция 1: Отключение IPv6 навсегда
 disable_ipv6() {
     log "=== 1. Отключение IPv6 навсегда ==="
+
     local grub_file="/etc/default/grub"
     local param="ipv6.disable=1"
-    
+
     if [[ ! -f "$grub_file" ]]; then
-        log "Ошибка: $grub_file не найден."
+        log "❌ Ошибка: $grub_file не найден"
         return 1
     fi
-    
-    local backup="${grub_file}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$grub_file" "$backup"
+
+    require_cmd sed
+    local backup
+    backup="$(backup_file "$grub_file")"
     log "Бэкап: $backup"
-    
-    # Добавляем в GRUB_CMDLINE_LINUX_DEFAULT
-    if ! grep -q "GRUB_CMDLINE_LINUX_DEFAULT=" "$grub_file"; then
-        sed -i "1iGRUB_CMDLINE_LINUX_DEFAULT=\"$param\"" "$grub_file"
+
+    append_grub_param "$grub_file" "GRUB_CMDLINE_LINUX_DEFAULT" "$param"
+    append_grub_param "$grub_file" "GRUB_CMDLINE_LINUX" "$param"
+
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        grub-mkconfig -o /boot/grub/grub.cfg
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        grub2-mkconfig -o /boot/grub2/grub.cfg
     else
-        sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT *= *\"\([^\"]*\)\"\)/GRUB_CMDLINE_LINUX_DEFAULT=\"\2 $param\"/g" "$grub_file"
-    fi
-    
-    # Добавляем в GRUB_CMDLINE_LINUX
-    if ! grep -q "GRUB_CMDLINE_LINUX=" "$grub_file"; then
-        sed -i "/GRUB_CMDLINE_LINUX_DEFAULT=/aGRUB_CMDLINE_LINUX=\"$param\"" "$grub_file"
-    else
-        sed -i "s/^\(GRUB_CMDLINE_LINUX *= *\"\([^\"]*\)\"\)/GRUB_CMDLINE_LINUX=\"\2 $param\"/g" "$grub_file"
-    fi
-    
-    # Удаляем дубликаты
-    sed -i "s/ $param *//g; s/$param  */ /g; s/ $param$//g" "$grub_file"
-    
-    if update-grub; then
-        log "✅ IPv6 отключен. Ребут для применения: reboot"
-        grep -E 'GRUB_CMDLINE_LINUX' "$grub_file"
-    else
-        log "❌ Ошибка update-grub. Восстанови из $backup"
+        log "❌ Не найдена команда обновления grub. Восстанови из $backup при необходимости"
         return 1
     fi
+
+    log "✅ IPv6 отключен. Ребут для применения: reboot"
+    grep -E '^(GRUB_CMDLINE_LINUX|GRUB_CMDLINE_LINUX_DEFAULT)=' "$grub_file" || true
 }
 
 # Функция 2: Установка Certbot + Nginx с конфигом
 setup_certbot_nginx() {
     log "=== 2. Certbot + Nginx SSL ==="
-    
+
+    export DEBIAN_FRONTEND=noninteractive
+
     # Останавливаем Caddy
-    if systemctl is-active --quiet caddy; then
-        systemctl stop caddy && systemctl disable caddy
-        log "✅ Caddy остановлен и отключен"
+    if systemctl list-unit-files | grep -q '^caddy\.service'; then
+        if systemctl is-active --quiet caddy; then
+            systemctl stop caddy
+            log "✅ Caddy остановлен"
+        fi
+        systemctl disable caddy >/dev/null 2>&1 || true
+        log "✅ Caddy отключен"
     else
-        log "ℹ️ Caddy не активен"
+        log "ℹ️ Caddy не найден"
     fi
-    
-    # Устанавливаем certbot
+
     apt update
-    apt install -y certbot python3-certbot-nginx
-    
+    apt install -y certbot python3-certbot-nginx nginx
+
     # Останавливаем nginx (если есть)
     if systemctl is-active --quiet nginx; then
         systemctl stop nginx
         log "✅ Nginx остановлен"
     fi
-    
+
     # Спрашиваем домен
-    read -p "Введите домен (например, nl.snowfall.top): " domain
-    domain="${domain:-example.com}"  # Дефолт если пусто
-    log "Домен: $domain"
-    
-    # Получаем сертификат standalone
-    if certbot certonly --standalone -d "$domain" --non-interactive --agree-tos --email admin@$domain; then
-        log "✅ Сертификат получен: /etc/letsencrypt/live/$domain/"
-    else
-        log "❌ Ошибка certbot. Проверьте домен/DNS/порт 80."
+    read -r -p "Введите домен (например, nl.snowfall.top): " domain
+    domain="${domain:-}"
+
+    if [[ -z "$domain" ]]; then
+        log "❌ Домен не введен"
         return 1
     fi
-    
-    # Устанавливаем/запускаем nginx
-    apt update -y && apt install -y nginx
-    systemctl start nginx && systemctl enable nginx
+
+    log "Домен: $domain"
+
+    # Получаем сертификат standalone
+    if certbot certonly --standalone -d "$domain" --non-interactive --agree-tos --email "admin@$domain"; then
+        log "✅ Сертификат получен: /etc/letsencrypt/live/$domain/"
+    else
+        log "❌ Ошибка certbot. Проверьте домен, DNS и порт 80"
+        return 1
+    fi
+
+    systemctl enable nginx
+    systemctl start nginx
     log "✅ Nginx установлен и запущен"
-    
-    # Создаем /var/www/site
+
     mkdir -p /var/www/site
     echo "<h1>$(hostname) ready</h1>" > /var/www/site/index.html
-    
-    # Бэкап и новый конфиг
+
     local nginx_conf="/etc/nginx/sites-available/default"
-    local backup="${nginx_conf}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$nginx_conf" "$backup"
+    if [[ ! -f "$nginx_conf" ]]; then
+        log "❌ Не найден nginx конфиг: $nginx_conf"
+        return 1
+    fi
+
+    local backup
+    backup="$(backup_file "$nginx_conf")"
     log "Бэкап nginx: $backup"
-    
-    # Шаблон конфига с заменой домена
-    cat > "$nginx_conf" << EOF
+
+    cat > "$nginx_conf" <<EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
     server_name $domain;
@@ -116,7 +155,7 @@ server {
     ssl_prefer_server_ciphers on;
 
     ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
-    ssl_session_cache shared:SSL:1m;
+    ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
 
@@ -132,113 +171,103 @@ server {
     }
 }
 EOF
-    
-    # Тест и релоад
+
     if nginx -t; then
         systemctl reload nginx
-        log "✅ Nginx конфиг OK. Проверьте: curl -k https://127.0.0.1:8443/"
+        log "✅ Nginx конфиг OK"
+        log "⚠️ Учти: обычный curl к 127.0.0.1:8443 может не работать из-за proxy_protocol"
     else
         log "❌ Ошибка nginx -t. Восстанови из $backup"
         return 1
     fi
 }
 
+# Функции вывода для Device Guard
+print_info()    { echo -e "\033[0;36m[ℹ]\033[0m \033[1;37m$1\033[0m"; }
+print_error()   { echo -e "\033[0;31m[✗]\033[0m \033[1;37m$1\033[0m"; }
+print_warning() { echo -e "\033[1;33m[⚠]\033[0m \033[1;37m$1\033[0m"; }
+print_success() { echo -e "\033[0;32m[✓]\033[0m \033[1;37m$1\033[0m"; }
+print_step()    { echo -e "\033[0;35m\033[1m▸ $1\033[0m"; }
+
 # Функция 3: Device Guard (Remnanode → Telegram Bot)
 setup_device_guard() {
     log "=== 3. Device Guard (Remnanode → Telegram Bot) ==="
-    
-    # Цвета (ПРАВИЛЬНЫЙ синтаксис)
-    local RED=$'\033[0;31m'
-    local GREEN=$'\033[0;32m'
-    local YELLOW=$'\033[1;33m'
-    local BLUE=$'\033[0;34m'
-    local MAGENTA=$'\033[0;35m'
-    local CYAN=$'\033[0;36m'
-    local WHITE=$'\033[1;37m'
-    local BOLD=$'\033[1m'
-    local NC=$'\033[0m'
-    
+
     # НАСТРОЙКИ - ИЗМЕНИ ТОЛЬКО ЭТУ СТРОКУ
-    local BOT_DOMAIN="your-bot-domain.com"  # ← ТВОЙ ДОМЕН БОТА
+    local BOT_DOMAIN="your-bot-domain.com"
     local TIME_WINDOW=15
-    
+
     local INSTALL_DIR="/opt/device-guard"
     local SCRIPT_PATH="${INSTALL_DIR}/report.sh"
-    local LOG_FILE="/var/log/remnanode/access.log"
+    local REMNANODE_LOG_FILE="/var/log/remnanode/access.log"
     local DOCKER_COMPOSE_FILE="/opt/remnanode/docker-compose.yml"
-    
-    # Print функции
-    print_info() { echo -e "${CYAN}[ℹ]${NC} ${WHITE}$1${NC}"; }
-    print_error() { echo -e "${RED}[✗]${NC} ${WHITE}$1${NC}"; }
-    print_warning() { echo -e "${YELLOW}[⚠]${NC} ${WHITE}$1${NC}"; }
-    print_success() { echo -e "${GREEN}[✓]${NC} ${WHITE}$1${NC}"; }
-    print_step() { echo -e "${MAGENTA}${BOLD}▸ $1${NC}"; }
-    
+
     clear
     echo ""
-    echo -e "${CYAN}╔═════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}${MAGENTA}██████╗ ███████╗██╗   ██╗██╗ ██████╗███████╗${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}${MAGENTA}██╔══██╗██╔════╝██║   ██║██║██╔════╝██╔════╝${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}${MAGENTA}██║  ██║█████╗  ██║   ██║██║██║     █████╗${NC}            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}${MAGENTA}██║  ██║██╔══╝  ╚██╗ ██╔╝██║██║     ██╔══╝${NC}            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}${MAGENTA}██████╔╝███████╗ ╚████╔╝ ██║╚██████╗███████╗${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}${MAGENTA}╚═════╝ ╚══════╝  ╚═══╝  ╚═╝ ╚═════╝╚══════╝${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}                                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}      ${BOLD}${WHITE}██████╗ ██╗   ██╗ █████╗ ██████╗ ██████╗${NC}           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}      ${BOLD}${WHITE}██╔════╝ ██║   ██║██╔══██╗██╔══██╗██╔══██╗${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}      ${BOLD}${WHITE}██║  ███╗██║   ██║███████║██████╔╝██║  ██║${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}      ${BOLD}${WHITE}██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}      ${BOLD}${WHITE}╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝${NC}          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}      ${BOLD}${WHITE}╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝${NC}           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}                                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}╚═════════════════════════════════════════════════════════════════╝${NC}"
+    echo "╔═════════════════════════════════════════════════════════════════╗"
+    echo "║                      DEVICE GUARD SETUP                        ║"
+    echo "╚═════════════════════════════════════════════════════════════════╝"
     echo ""
-    
-    # Извлечение SECRET_KEY
+
     print_info "Поиск SECRET_KEY в ${DOCKER_COMPOSE_FILE}..."
+
     if [[ ! -f "$DOCKER_COMPOSE_FILE" ]]; then
-        print_error "Файл ${DOCKER_COMPOSE_FILE} не найден!"
+        print_error "Файл ${DOCKER_COMPOSE_FILE} не найден"
         print_error "Убедитесь, что remnanode установлен в /opt/remnanode/"
-        read -p "Enter для продолжения..."
+        read -r -p "Enter для продолжения..."
         return 1
     fi
-    
-    local SECRET_KEY=$(grep -E '^\s*-?\s*SECRET_KEY=' "$DOCKER_COMPOSE_FILE" | head -1 | sed -E 's/.*SECRET_KEY=(.+)/\1/' | tr -d '\r')
-    
+
+    local SECRET_KEY
+    SECRET_KEY="$(grep -E 'SECRET_KEY=' "$DOCKER_COMPOSE_FILE" | head -1 | sed -E 's/.*SECRET_KEY=([^"'\''[:space:]]+).*/\1/' | tr -d '\r' || true)"
+
     if [[ -z "$SECRET_KEY" ]]; then
         print_error "SECRET_KEY не найден в ${DOCKER_COMPOSE_FILE}"
-        read -p "Enter для продолжения..."
+        read -r -p "Enter для продолжения..."
         return 1
     fi
+
     print_success "SECRET_KEY извлечен (${#SECRET_KEY} символов)"
     echo ""
-    
-    # Шаг 1: Создание директории
-    print_step "Шаг 1/7: Создание директории"
-    mkdir -p "$INSTALL_DIR"
-    print_success "Директория создана: $INSTALL_DIR"
-    echo ""
-    
-    # Создание полного скрипта report.sh
-    cat > "$SCRIPT_PATH" << 'EOFSCRIPT'
-#!/bin/bash
-WEBHOOKS=(
-  "https://DOMAIN_PLACEHOLDER/device-report|SECRET_PLACEHOLDER"
-)
-TIME_WINDOW=TIME_WINDOW_PLACEHOLDER
-LOG_FILE="LOG_FILE_PLACEHOLDER"
 
-DATA=$(tail -n 10000 "$LOG_FILE" 2>/dev/null | \
-  awk -v window="$TIME_WINDOW" '
+    print_step "Шаг 1/7: Установка зависимостей"
+    apt-get update -qq
+    apt-get install -y cron curl >/dev/null 2>&1
+    systemctl enable cron >/dev/null 2>&1 || true
+    systemctl start cron >/dev/null 2>&1 || true
+    print_success "cron и curl готовы"
+    echo ""
+
+    print_step "Шаг 2/7: Создание директорий и логов"
+    install -d -m 755 "$INSTALL_DIR"
+    install -d -m 755 /var/log/remnanode
+    touch "$REMNANODE_LOG_FILE"
+    chmod 644 "$REMNANODE_LOG_FILE"
+    print_success "Директории и лог-файл готовы"
+    echo ""
+
+    print_step "Шаг 3/7: Генерация report.sh"
+
+    cat > "$SCRIPT_PATH" <<EOF
+#!/bin/bash
+set -Eeuo pipefail
+IFS=\$'\n\t'
+
+WEBHOOKS=(
+  "https://${BOT_DOMAIN}/device-report|${SECRET_KEY}"
+)
+TIME_WINDOW=${TIME_WINDOW}
+LOG_FILE="${REMNANODE_LOG_FILE}"
+
+DATA=\$(tail -n 10000 "\$LOG_FILE" 2>/dev/null | awk -v window="\$TIME_WINDOW" '
   /email:/ {
-    split($1, d, "/")
-    split($2, t, ":")
+    split(\$1, d, "/")
+    split(\$2, t, ":")
     split(t[3], sec, ".")
     ts = mktime(d[1] " " d[2] " " d[3] " " t[1] " " t[2] " " sec[1])
-    match($0, /from ([0-9.]+):/, iparr)
-    match($0, /email: ([0-9]+)/, emarr)
-    if(iparr[1] && emarr[1]) {
+    match(\$0, /from ([0-9.]+):/, iparr)
+    match(\$0, /email: ([0-9]+)/, emarr)
+    if (iparr[1] && emarr[1]) {
       n = ++total
       all_ts[n] = ts
       all_ip[n] = iparr[1]
@@ -255,82 +284,89 @@ DATA=$(tail -n 10000 "$LOG_FILE" 2>/dev/null | \
         key = em SUBSEP ip
         if (!(key in seen)) {
           seen[key] = 1
-          users[em] = users[em] ? users[em] ",\"" ip "\"" : "\"" ip "\""
+          users[em] = users[em] ? users[em] ",\\"" ip "\\"" : "\\"" ip "\\""
         }
       }
     }
-    printf "{\"ts\":%d,\"users\":{", systime()
+    printf "{\\"ts\\":%d,\\"users\\":{", systime()
     first = 1
     for (em in users) {
       if (!first) printf ","
-      printf "\"%s\":[%s]", em, users[em]
+      printf "\\"%s\\":[%s]", em, users[em]
       first = 0
     }
     print "}}"
   }')
 
-for entry in "${WEBHOOKS[@]}"; do
-  URL="${entry%%|*}"
-  KEY="${entry##*|}"
-  echo "$DATA" | curl -s -X POST "$URL" \
+for entry in "\${WEBHOOKS[@]}"; do
+  URL="\${entry%%|*}"
+  KEY="\${entry##*|}"
+  curl -s -X POST "\$URL" \
     -H "Content-Type: application/json" \
-    -H "X-Api-Key: $KEY" \
-    -d @- > /dev/null 2>&1 &
+    -H "X-Api-Key: \$KEY" \
+    -d "\$DATA" >/dev/null 2>&1 &
 done
 
 wait
-EOFSCRIPT
-    
-    # Замены плейсхолдеров
-    sed -i "s|DOMAIN_PLACEHOLDER|${BOT_DOMAIN}|g" "$SCRIPT_PATH"
-    sed -i "s|SECRET_PLACEHOLDER|${SECRET_KEY}|g" "$SCRIPT_PATH"
-    sed -i "s|TIME_WINDOW_PLACEHOLDER|${TIME_WINDOW}|g" "$SCRIPT_PATH"
-    sed -i "s|LOG_FILE_PLACEHOLDER|${LOG_FILE}|g" "$SCRIPT_PATH"
-    
-    chmod +x "$SCRIPT_PATH"
-    mkdir -p /var/log/remnanode/ && chmod -R 777 /var/log/remnanode/
-    
-    # Cron каждые 2 минуты
-    local CRON_JOB="*/2 * * * * $SCRIPT_PATH"
-    (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH"; echo "$CRON_JOB") | crontab -
-    
-    apt-get update -qq && apt-get install -y cron curl 2>/dev/null || true
-    systemctl enable cron 2>/dev/null || true
-    systemctl start cron 2>/dev/null || true
-    
-    # Финальный баннер
+EOF
+
+    chmod 750 "$SCRIPT_PATH"
+    print_success "Скрипт создан: $SCRIPT_PATH"
     echo ""
-    echo -e "${GREEN}╔═════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${NC}            ${BOLD}${WHITE}✓ УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!${NC}                   ${GREEN}║${NC}"
-    echo -e "${GREEN}╚═════════════════════════════════════════════════════════════════╝${NC}"
-    echo -e "${CYAN}Скрипт:${NC} ${GREEN}$SCRIPT_PATH${NC} | ${CYAN}Cron:${NC} ${GREEN}*/2 * * * *${NC}"
-    echo -e "${MAGENTA}Проверить:${NC} ${WHITE}crontab -l | grep device-guard${NC}"
+
+    print_step "Шаг 4/7: Настройка cron"
+    local CRON_JOB="*/2 * * * * $SCRIPT_PATH"
+    (
+        crontab -l 2>/dev/null | grep -F -v "$SCRIPT_PATH" || true
+        echo "$CRON_JOB"
+    ) | crontab -
+    print_success "Cron добавлен: $CRON_JOB"
+    echo ""
+
+    print_step "Шаг 5/7: Проверка файла"
+    if [[ -x "$SCRIPT_PATH" ]]; then
+        print_success "report.sh исполняемый"
+    else
+        print_error "report.sh не исполняемый"
+        return 1
+    fi
+    echo ""
+
+    print_step "Шаг 6/7: Финальная информация"
+    print_info "Скрипт: $SCRIPT_PATH"
+    print_info "Лог: $REMNANODE_LOG_FILE"
+    print_info "Cron: */2 * * * *"
+    echo ""
+
+    print_step "Шаг 7/7: Готово"
+    print_success "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО"
+    print_info "Проверить cron: crontab -l | grep device-guard"
 }
 
 # Главное меню
 main_menu() {
     check_root
-    log "=== Bash-комбайн Setup (версия 1.0) ==="
+    log "=== Bash-комбайн Setup (версия 1.1) ==="
     log "Логи: $LOG_FILE"
-    
+
     while true; do
         echo ""
         echo "1) Отключить IPv6 навсегда"
         echo "2) Certbot + Nginx SSL (Caddy → Nginx)"
         echo "3) Device Guard (Remnanode → Telegram Bot)"
         echo "0) Выход"
-        read -p "Выбор: " choice
-        
-        case $choice in
+        read -r -p "Выбор: " choice
+
+        case "$choice" in
             1) disable_ipv6 ;;
             2) setup_certbot_nginx ;;
             3) setup_device_guard ;;
             0) log "Пока!"; exit 0 ;;
             *) log "❌ Неверный пункт" ;;
         esac
-        read -p "Enter для продолжения..."
+
+        read -r -p "Enter для продолжения..."
     done
 }
 
 main_menu "$@"
-
