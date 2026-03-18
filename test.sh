@@ -419,7 +419,7 @@ main_menu() {
         echo "3) Device Guard"
         echo "4) UFW + Node Exporter"
         echo "0) Выход"
-        read -r -p "Выбор: " choice
+        read -r -p "Выбор: " choice || true
 
         case "$choice" in
             1) disable_ipv6 ;;
@@ -430,7 +430,7 @@ main_menu() {
             *) log "❌ Неверный пункт" ;;
         esac
 
-        read -r -p "Enter для продолжения..."
+        read -r -p "Enter для продолжения..." || true
     done
 }
 
