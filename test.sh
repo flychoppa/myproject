@@ -62,67 +62,91 @@ disable_ipv6() {
 
 # --- 2 ---
 setup_certbot_nginx() {
-    log "=== 2. Certbot + Nginx ==="
+log "=== 2. Certbot + Nginx ==="
 
-    export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_FRONTEND=noninteractive
 
-        # --- УБИВАЕМ CADDY ---
-    log "Проверка Caddy..."
-    
-    if systemctl status caddy >/dev/null 2>&1; then
-        if systemctl is-active --quiet caddy; then
-            log "Останавливаем Caddy..."
-            safe_run systemctl stop caddy
-        fi
-    
-        log "Отключаем Caddy..."
-        safe_run systemctl disable caddy
-    
-        log "Удаляем Caddy..."
-        safe_run apt purge -y caddy
-        safe_run apt autoremove -y
-    
-        log "✅ Caddy удалён"
-    else
-        log "ℹ️ Caddy не найден"
+# --- УБИВАЕМ CADDY ---
+log "Проверка Caddy..."
+
+if systemctl status caddy >/dev/null 2>&1; then
+    if systemctl is-active --quiet caddy; then
+        log "Останавливаем Caddy..."
+        safe_run systemctl stop caddy
     fi
-    
-    safe_run apt update
-    safe_run apt install -y certbot python3-certbot-nginx nginx
 
-    read -r -p "Введите домен: " domain
-    [[ -z "$domain" ]] && { log "❌ Домен не введен"; return; }
+    log "Отключаем Caddy..."
+    safe_run systemctl disable caddy
 
-    safe_run certbot certonly --standalone -d "$domain" \
-        --non-interactive --agree-tos --email "admin@$domain"
+    log "Удаляем Caddy..."
+    safe_run apt purge -y caddy
+    safe_run apt autoremove -y
 
-    safe_run systemctl enable nginx
-    safe_run systemctl start nginx
+    log "✅ Caddy удалён"
+else
+    log "ℹ️ Caddy не найден"
+fi
 
+# --- УСТАНОВКА ---
+safe_run apt update
+safe_run apt install -y certbot python3-certbot-nginx nginx
+
+read -r -p "Введите домен: " domain
+[[ -z "$domain" ]] && { log "❌ Домен не введен"; return; }
+
+# --- ПОЛУЧЕНИЕ SSL ---
+safe_run certbot certonly --standalone -d "$domain" \
+    --non-interactive --agree-tos --email "admin@$domain"
+
+safe_run systemctl enable nginx
+safe_run systemctl start nginx
+
+# --- САЙТ ---
+log "Настройка сайта..."
+
+if [ -d "/var/www/site" ]; then
+    rm -rf /var/www/site/*
+else
     mkdir -p /var/www/site
+fi
+
+if [ -d "/opt/remnasetup/data/site" ] && [ "$(ls -A /opt/remnasetup/data/site 2>/dev/null)" ]; then
+    log "Копируем сайт из /opt/remnasetup..."
+    cp -r /opt/remnasetup/data/site/* /var/www/site/
+else
+    log "⚠️ Сайт не найден, создаём fallback страницу"
     echo "<h1>$(hostname) ready</h1>" > /var/www/site/index.html
+fi
 
-    cat > /etc/nginx/sites-available/default <<EOF
+# права
+chown -R www-data:www-data /var/www/site
+chmod -R 755 /var/www/site
+
+# --- NGINX CONFIG ---
+cat > /etc/nginx/sites-available/default <<EOF
+
 server {
-    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
-    server_name $domain;
+listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+server_name $domain;
 
-    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
 
-    root /var/www/site;
-    index index.html;
+root /var/www/site;
+index index.html;
 
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
+location / {
+    try_files \$uri \$uri/ =404;
+}
+
 }
 EOF
 
-    safe_run nginx -t
-    safe_run systemctl reload nginx
+safe_run nginx -t
+safe_run systemctl reload nginx
 
-    log "✅ Nginx готов"
+log "✅ Nginx готов"
+
 }
 
 # --- 3 ---
