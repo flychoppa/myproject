@@ -60,83 +60,75 @@ disable_ipv6() {
     log "✅ IPv6 отключен (нужен reboot)"
 }
 
-# --- 2 ---
 setup_certbot_nginx() {
-log "=== Certbot + Nginx ==="
+    log "=== Certbot + Nginx ==="
 
-```
-export DEBIAN_FRONTEND=noninteractive
+    export DEBIAN_FRONTEND=noninteractive
 
-# --- STOP + DISABLE CADDY ---
-log "Останавливаем Caddy..."
-systemctl stop caddy 2>/dev/null || true
-systemctl disable caddy 2>/dev/null || true
+    # --- STOP + DISABLE CADDY ---
+    log "Останавливаем Caddy..."
+    systemctl stop caddy 2>/dev/null || true
+    systemctl disable caddy 2>/dev/null || true
 
-# --- INSTALL CERTBOT ---
-apt update -y
-apt install -y certbot python3-certbot-nginx
+    # --- INSTALL CERTBOT ---
+    apt update -y
+    apt install -y certbot python3-certbot-nginx
 
-# --- STOP NGINX (если есть) ---
-systemctl stop nginx 2>/dev/null || true
+    # --- STOP NGINX ---
+    systemctl stop nginx 2>/dev/null || true
 
-# --- DOMAIN ---
-read -r -p "Введите домен: " domain
-[[ -z "$domain" ]] && { log "❌ Домен не введен"; return; }
+    # --- DOMAIN ---
+    read -r -p "Введите домен: " domain
+    if [[ -z "$domain" ]]; then
+        log "❌ Домен не введен"
+        return
+    fi
 
-# --- SSL ---
-certbot certonly --standalone -d "$domain" \
-    --non-interactive --agree-tos --email "admin@$domain"
+    # --- SSL ---
+    certbot certonly --standalone -d "$domain" \
+        --non-interactive --agree-tos --email "admin@$domain"
 
-# --- INSTALL + START NGINX ---
-apt install -y nginx
-systemctl start nginx
-systemctl enable nginx
+    # --- INSTALL + START NGINX ---
+    apt install -y nginx
+    systemctl start nginx
+    systemctl enable nginx
 
-# --- NGINX CONFIG ---
-log "Записываем конфиг nginx..."
+    # --- CONFIG ---
+    log "Записываем конфиг nginx..."
 
-cat > /etc/nginx/sites-available/default <<EOF
-```
-
+    cat > /etc/nginx/sites-available/default <<EOF
 server {
-listen 127.0.0.1:8443 ssl http2 proxy_protocol;
-server_name $domain;
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+    server_name $domain;
 
-```
-ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
 
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_prefer_server_ciphers on;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
 
-ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
-ssl_session_cache shared:SSL:1m;
-ssl_session_timeout 1d;
-ssl_session_tickets off;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+    ssl_session_cache shared:SSL:1m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
 
-real_ip_header proxy_protocol;
-set_real_ip_from 127.0.0.1;
-set_real_ip_from ::1;
+    real_ip_header proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+    set_real_ip_from ::1;
 
-root /var/www/site;
-index index.html;
+    root /var/www/site;
+    index index.html;
 
-location / {
-    try_files \$uri \$uri/ =404;
-}
-```
-
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
 }
 EOF
 
-```
-# --- RESTART ---
-nginx -t
-systemctl restart nginx
+    nginx -t
+    systemctl restart nginx
 
-log "✅ Готово"
-```
-
+    log "✅ Готово"
 }
 
 
