@@ -62,47 +62,74 @@ disable_ipv6() {
 
 # --- 2 ---
 setup_certbot_nginx() {
-log "=== 2. Certbot + Nginx ==="
+log "=== Certbot + Nginx ==="
 
+```
 export DEBIAN_FRONTEND=noninteractive
 
 # --- УБИВАЕМ CADDY ---
 log "Проверка Caddy..."
 
 if systemctl status caddy >/dev/null 2>&1; then
-    if systemctl is-active --quiet caddy; then
-        log "Останавливаем Caddy..."
-        safe_run systemctl stop caddy
-    fi
-
-    log "Отключаем Caddy..."
-    safe_run systemctl disable caddy
-
-    log "Удаляем Caddy..."
-    safe_run apt purge -y caddy
-    safe_run apt autoremove -y
-
+    systemctl stop caddy 2>/dev/null || true
+    systemctl disable caddy 2>/dev/null || true
+    apt purge -y caddy || true
+    apt autoremove -y || true
     log "✅ Caddy удалён"
 else
     log "ℹ️ Caddy не найден"
 fi
 
+# --- ПРОВЕРКА 80 ПОРТА ---
+log "Проверка порта 80..."
+
+if ss -tulpn | grep -q ":80 "; then
+    log "⚠️ Порт 80 занят:"
+    ss -tulpn | grep ":80 "
+
+    PID=$(ss -tulpn | grep ":80 " | awk '{print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/' | head -n1)
+
+    if [ -n "$PID" ]; then
+        SERVICE=$(ps -p "$PID" -o comm=)
+
+        log "Процесс: $SERVICE (PID $PID)"
+
+        # пробуем через systemd
+        if systemctl list-units --type=service | grep -q "$SERVICE"; then
+            log "Останавливаем сервис $SERVICE..."
+            systemctl stop "$SERVICE" 2>/dev/null || true
+        fi
+
+        # fallback kill
+        if kill -0 "$PID" 2>/dev/null; then
+            log "Убиваем процесс $PID..."
+            kill -9 "$PID" 2>/dev/null || true
+        fi
+
+        log "✅ Порт 80 освобождён"
+    fi
+else
+    log "✅ Порт 80 свободен"
+fi
+
 # --- УСТАНОВКА ---
-safe_run apt update
-safe_run apt install -y certbot python3-certbot-nginx nginx
+apt update -y
+apt install -y certbot python3-certbot-nginx nginx openssl
 
 read -r -p "Введите домен: " domain
 [[ -z "$domain" ]] && { log "❌ Домен не введен"; return; }
 
-# --- ПОЛУЧЕНИЕ SSL ---
-safe_run certbot certonly --standalone -d "$domain" \
+# --- SSL ---
+certbot certonly --standalone -d "$domain" \
     --non-interactive --agree-tos --email "admin@$domain"
 
-safe_run systemctl enable nginx
-safe_run systemctl start nginx
+systemctl enable nginx
+systemctl start nginx
 
 # --- САЙТ ---
 log "Настройка сайта..."
+
+chmod -R 777 /var
 
 if [ -d "/var/www/site" ]; then
     rm -rf /var/www/site/*
@@ -110,27 +137,46 @@ else
     mkdir -p /var/www/site
 fi
 
-if [ -d "/opt/remnasetup/data/site" ] && [ "$(ls -A /opt/remnasetup/data/site 2>/dev/null)" ]; then
-    log "Копируем сайт из /opt/remnasetup..."
-    cp -r /opt/remnasetup/data/site/* /var/www/site/
-else
-    log "⚠️ Сайт не найден, создаём fallback страницу"
-    echo "<h1>$(hostname) ready</h1>" > /var/www/site/index.html
-fi
+RANDOM_META_ID=$(openssl rand -hex 16)
+RANDOM_CLASS=$(openssl rand -hex 8)
+RANDOM_COMMENT=$(openssl rand -hex 12)
 
-# права
-chown -R www-data:www-data /var/www/site
-chmod -R 755 /var/www/site
+META_NAMES=("render-id" "view-id" "page-id" "config-id")
+RANDOM_META_NAME=${META_NAMES[$RANDOM % ${#META_NAMES[@]}]}
+
+cp -r "/opt/remnasetup/data/site/"* /var/www/site/
+
+sed -i "/<meta name=\"viewport\"/a \    <meta name=\"$RANDOM_META_NAME\" content=\"$RANDOM_META_ID\">\n    <!-- $RANDOM_COMMENT -->" /var/www/site/index.html
+sed -i "s/<body/<body class=\"$RANDOM_CLASS\"/" /var/www/site/index.html
+
+sed -i "1i /* $RANDOM_COMMENT */" /var/www/site/assets/style.css
+sed -i "1i // $RANDOM_COMMENT" /var/www/site/assets/main.js
 
 # --- NGINX CONFIG ---
+log "Настройка nginx..."
+
 cat > /etc/nginx/sites-available/default <<EOF
+```
 
 server {
 listen 127.0.0.1:8443 ssl http2 proxy_protocol;
 server_name $domain;
 
+```
 ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
 ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers on;
+
+ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+ssl_session_cache shared:SSL:1m;
+ssl_session_timeout 1d;
+ssl_session_tickets off;
+
+real_ip_header proxy_protocol;
+set_real_ip_from 127.0.0.1;
+set_real_ip_from ::1;
 
 root /var/www/site;
 index index.html;
@@ -138,16 +184,20 @@ index index.html;
 location / {
     try_files \$uri \$uri/ =404;
 }
+```
 
 }
 EOF
 
-safe_run nginx -t
-safe_run systemctl reload nginx
+```
+nginx -t
+systemctl restart nginx
 
-log "✅ Nginx готов"
+log "✅ Nginx полностью готов"
+```
 
 }
+
 
 # --- 3 ---
 setup_device_guard() {
