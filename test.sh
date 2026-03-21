@@ -67,55 +67,19 @@ log "=== Certbot + Nginx ==="
 ```
 export DEBIAN_FRONTEND=noninteractive
 
-# --- УБИВАЕМ CADDY ---
-log "Проверка Caddy..."
+# --- STOP + DISABLE CADDY ---
+log "Останавливаем Caddy..."
+systemctl stop caddy 2>/dev/null || true
+systemctl disable caddy 2>/dev/null || true
 
-if systemctl status caddy >/dev/null 2>&1; then
-    systemctl stop caddy 2>/dev/null || true
-    systemctl disable caddy 2>/dev/null || true
-    apt purge -y caddy || true
-    apt autoremove -y || true
-    log "✅ Caddy удалён"
-else
-    log "ℹ️ Caddy не найден"
-fi
-
-# --- ПРОВЕРКА 80 ПОРТА ---
-log "Проверка порта 80..."
-
-if ss -tulpn | grep -q ":80 "; then
-    log "⚠️ Порт 80 занят:"
-    ss -tulpn | grep ":80 "
-
-    PID=$(ss -tulpn | grep ":80 " | awk '{print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/' | head -n1)
-
-    if [ -n "$PID" ]; then
-        SERVICE=$(ps -p "$PID" -o comm=)
-
-        log "Процесс: $SERVICE (PID $PID)"
-
-        # пробуем через systemd
-        if systemctl list-units --type=service | grep -q "$SERVICE"; then
-            log "Останавливаем сервис $SERVICE..."
-            systemctl stop "$SERVICE" 2>/dev/null || true
-        fi
-
-        # fallback kill
-        if kill -0 "$PID" 2>/dev/null; then
-            log "Убиваем процесс $PID..."
-            kill -9 "$PID" 2>/dev/null || true
-        fi
-
-        log "✅ Порт 80 освобождён"
-    fi
-else
-    log "✅ Порт 80 свободен"
-fi
-
-# --- УСТАНОВКА ---
+# --- INSTALL CERTBOT ---
 apt update -y
-apt install -y certbot python3-certbot-nginx nginx openssl
+apt install -y certbot python3-certbot-nginx
 
+# --- STOP NGINX (если есть) ---
+systemctl stop nginx 2>/dev/null || true
+
+# --- DOMAIN ---
 read -r -p "Введите домен: " domain
 [[ -z "$domain" ]] && { log "❌ Домен не введен"; return; }
 
@@ -123,37 +87,13 @@ read -r -p "Введите домен: " domain
 certbot certonly --standalone -d "$domain" \
     --non-interactive --agree-tos --email "admin@$domain"
 
-systemctl enable nginx
+# --- INSTALL + START NGINX ---
+apt install -y nginx
 systemctl start nginx
-
-# --- САЙТ ---
-log "Настройка сайта..."
-
-chmod -R 777 /var
-
-if [ -d "/var/www/site" ]; then
-    rm -rf /var/www/site/*
-else
-    mkdir -p /var/www/site
-fi
-
-RANDOM_META_ID=$(openssl rand -hex 16)
-RANDOM_CLASS=$(openssl rand -hex 8)
-RANDOM_COMMENT=$(openssl rand -hex 12)
-
-META_NAMES=("render-id" "view-id" "page-id" "config-id")
-RANDOM_META_NAME=${META_NAMES[$RANDOM % ${#META_NAMES[@]}]}
-
-cp -r "/opt/remnasetup/data/site/"* /var/www/site/
-
-sed -i "/<meta name=\"viewport\"/a \    <meta name=\"$RANDOM_META_NAME\" content=\"$RANDOM_META_ID\">\n    <!-- $RANDOM_COMMENT -->" /var/www/site/index.html
-sed -i "s/<body/<body class=\"$RANDOM_CLASS\"/" /var/www/site/index.html
-
-sed -i "1i /* $RANDOM_COMMENT */" /var/www/site/assets/style.css
-sed -i "1i // $RANDOM_COMMENT" /var/www/site/assets/main.js
+systemctl enable nginx
 
 # --- NGINX CONFIG ---
-log "Настройка nginx..."
+log "Записываем конфиг nginx..."
 
 cat > /etc/nginx/sites-available/default <<EOF
 ```
@@ -190,13 +130,15 @@ location / {
 EOF
 
 ```
+# --- RESTART ---
 nginx -t
 systemctl restart nginx
 
-log "✅ Nginx полностью готов"
+log "✅ Готово"
 ```
 
 }
+
 
 
 # --- 3 ---
