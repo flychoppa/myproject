@@ -259,44 +259,6 @@ EOFSCRIPT
     log "Проверка: crontab -l | grep device-guard"
 }
 
-# --- 4 ---
-setup_ufw() {
-    log "=== 4. UFW + Node Exporter ==="
-
-    export DEBIAN_FRONTEND=noninteractive
-
-    safe_run apt update
-    safe_run apt install -y ufw curl
-
-    # reset безопасно
-    safe_run ufw --force reset
-
-    safe_run ufw default deny incoming
-    safe_run ufw default allow outgoing
-
-    # порты
-    # ufw limit уже включает разрешение — отдельный allow 22 не нужен
-    safe_run ufw limit 22
-    safe_run ufw allow 3001
-    safe_run ufw allow 80
-    safe_run ufw allow 443
-    safe_run ufw allow 1443
-
-    # node exporter — доступ только с конкретного IP
-    safe_run ufw allow proto tcp from 193.23.194.101 to any port 9100
-
-    safe_run ufw --force enable
-
-    log "✅ UFW настроен"
-    ufw status verbose || true
-
-    # --- Установка node exporter ---
-    log "=== Установка Node Exporter ==="
-    safe_run bash <(curl -fsSL https://raw.githubusercontent.com/hteppl/sh/master/node_install.sh)
-
-    log "✅ Node Exporter установлен"
-}
-
 # --- 5 ---
 setup_vpn_limits() {
     log "=== 5. VPN Limits (conntrack, sysctl, ulimit, systemd) ==="
@@ -311,7 +273,7 @@ setup_vpn_limits() {
     CT_BUCKETS=$((CT_MAX / 4))
     log "RAM: ${RAM_MB}MB → conntrack max: ${CT_MAX}"
 
-    # --- sysctl (zzz- чтобы быть последним) ---
+    # --- sysctl ---
     log "Шаг 1/4: sysctl..."
     cat > /etc/sysctl.d/zzz-vpn-limits.conf << EOF
 net.netfilter.nf_conntrack_max = ${CT_MAX}
@@ -353,14 +315,15 @@ net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
 
-    # Применяем принудительно напрямую — минуя порядок файлов
+    # Применяем напрямую — sed убирает пробелы только по краям, не внутри значения
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         key=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-        val=$(echo "$line" | cut -d= -f2- | tr -d ' ')
+        val=$(echo "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
         sysctl -w "$key=$val" -q 2>/dev/null || \
             log "⚠️ Не применился: $key"
     done < /etc/sysctl.d/zzz-vpn-limits.conf
+
     log "✅ sysctl применён"
 
     # --- BBR ---
@@ -400,7 +363,7 @@ UNIT
     done
     safe_run systemctl daemon-reload
 
-    # --- Итоговая проверка ---
+    # --- Проверка ---
     log "=== Проверка ==="
     python3 - << 'PYEOF'
 import subprocess
@@ -418,27 +381,30 @@ checks = [
     ("somaxconn",           lambda: sctl('net.core.somaxconn'),                  lambda v: int(v) >= 8192),
     ("ip_local_port_range", lambda: sctl('net.ipv4.ip_local_port_range'),        lambda v: int(v.split()[1])-int(v.split()[0]) >= 40000),
     ("rmem_max",            lambda: f"{int(sctl('net.core.rmem_max')):,}",       lambda v: int(v.replace(',','')) >= 16777216),
+    ("tcp_rmem",            lambda: sctl('net.ipv4.tcp_rmem'),                   lambda v: int(v.split()[2]) >= 16777216),
+    ("tcp_wmem",            lambda: sctl('net.ipv4.tcp_wmem'),                   lambda v: int(v.split()[2]) >= 16777216),
     ("tcp_keepalive_time",  lambda: sctl('net.ipv4.tcp_keepalive_time'),         lambda v: int(v) <= 300),
     ("tcp_fin_timeout",     lambda: sctl('net.ipv4.tcp_fin_timeout'),            lambda v: int(v) <= 30),
     ("netdev_max_backlog",  lambda: sctl('net.core.netdev_max_backlog'),         lambda v: int(v) >= 16384),
     ("bbr",                 lambda: sctl('net.ipv4.tcp_congestion_control'),     lambda v: v == 'bbr'),
+    ("conntrack timeout",   lambda: sctl('net.netfilter.nf_conntrack_tcp_timeout_established'), lambda v: int(v) <= 3600),
 ]
 
-print(f"{'Параметр':<24} {'Значение':<28} Статус")
-print("─" * 64)
+print(f"{'Параметр':<24} {'Значение':<32} Статус")
+print("─" * 68)
 for name, getter, ok_fn in checks:
     try:
         val = getter()
         ok = ok_fn(val)
-        print(f"{'✓' if ok else '✗'} {name:<22} {val:<28} {'ОК' if ok else 'ОПАСНО'}")
-    except:
-        print(f"? {name:<22} {'ошибка':<28}")
+        print(f"{'✓' if ok else '✗'} {name:<22} {val:<32} {'ОК' if ok else 'ОПАСНО'}")
+    except Exception as e:
+        print(f"? {name:<22} {'ошибка':<32}")
 
 print()
 print("Лимиты процессов:")
-import os
 for name in ['rw-core','nginx','xray','sing-box','haproxy']:
     try:
+        import os
         pid = subprocess.check_output(['pgrep','-o',name],text=True).strip()
         limit = [l for l in open(f'/proc/{pid}/limits').readlines() if 'open files' in l][0].split()[3]
         ok = int(limit) >= 65536
