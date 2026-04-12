@@ -702,7 +702,85 @@ EOF
     log "Проверка   : cat /etc/cron.d/vpn-weekly-reboot"
     log "⚠️  Сервер будет полностью перезагружаться каждое воскресенье в 04:00 МСК"
 }
+# --- 8 ---
+setup_net_admin() {
+    log "=== 8. NET_ADMIN: добавляем cap_add в remnanode ==="
 
+    local COMPOSE_FILE="/opt/remnanode/docker-compose.yml"
+
+    # --- Проверяем файл ---
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        log "❌ Файл не найден: $COMPOSE_FILE"
+        return 1
+    fi
+
+    # --- Уже есть? ---
+    if grep -q "NET_ADMIN" "$COMPOSE_FILE"; then
+        log "✅ NET_ADMIN уже присутствует, ничего не меняем"
+        return 0
+    fi
+
+    # --- Бэкап ---
+    local BACKUP="${COMPOSE_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$COMPOSE_FILE" "$BACKUP"
+    log "📦 Бэкап создан: $BACKUP"
+
+    # --- Вставляем cap_add после restart: always ---
+    python3 - << EOF
+import re, sys
+
+with open('$COMPOSE_FILE', 'r') as f:
+    content = f.read()
+
+insert = "    cap_add:\n      - NET_ADMIN\n"
+
+new_content = re.sub(
+    r'([ \t]*restart:\s*always\n)',
+    r'\1' + insert,
+    content,
+    count=1
+)
+
+if new_content == content:
+    print("❌ Строка 'restart: always' не найдена, файл не изменён")
+    sys.exit(1)
+
+with open('$COMPOSE_FILE', 'w') as f:
+    f.write(new_content)
+
+print("✅ cap_add: NET_ADMIN добавлен")
+EOF
+
+    # Проверяем что python3 отработал успешно
+    if [[ $? -ne 0 ]]; then
+        log "❌ Ошибка при изменении файла, восстанавливаем бэкап"
+        cp "$BACKUP" "$COMPOSE_FILE"
+        return 1
+    fi
+
+    # --- Показываем результат ---
+    log "Результат вставки:"
+    grep -A3 "restart: always" "$COMPOSE_FILE" | \
+        while IFS= read -r line; do log "  $line"; done
+
+    # --- Перезапускаем контейнер ---
+    log "Перезапускаем remnanode..."
+    cd /opt/remnanode || { log "❌ Не удалось перейти в /opt/remnanode"; return 1; }
+
+    docker compose down 2>&1 | tail -3 | while IFS= read -r line; do log "  $line"; done
+    docker compose up -d 2>&1 | tail -3 | while IFS= read -r line; do log "  $line"; done
+
+    # --- Проверяем что поднялся ---
+    sleep 3
+    if docker ps | grep -q remnanode; then
+        log "✅ remnanode запущен"
+        docker ps | grep remnanode | while IFS= read -r line; do log "  $line"; done
+    else
+        log "❌ remnanode не запустился, проверь docker logs remnanode"
+    fi
+
+    log "=== ✅ NET_ADMIN установлен ==="
+}
 # --- MENU ---
 main_menu() {
     check_root
@@ -717,6 +795,7 @@ main_menu() {
         echo "5) VPN Limits (conntrack / sysctl / ulimit)"
         echo "6) VPN Net Optimizer (RPS/RFS/XPS/IRQ/BBR)"
         echo "7) Cron: еженедельный перезапуск VPN (04:00 МСК)"
+        echo "8) NET_ADMIN: cap_add для remnanode"
         echo "0) Выход"
         read -r -p "Выбор: " choice || true
 
@@ -728,6 +807,7 @@ main_menu() {
             5) setup_vpn_limits ;;
             6) setup_net_optimizer ;;
             7) setup_cron_restart ;;
+            8) setup_net_admin ;;
             0) exit 0 ;;
             *) log "❌ Неверный пункт" ;;
         esac
