@@ -34,7 +34,7 @@ append_grub_param() {
 
     if grep -Eq "^${key}=" "$file"; then
         grep -Eq "${param}" "$file" || \
-        sed -i -E "s|^(${key}=\")([^\"]*)\"|\\1\\2 ${param}\"|" "$file"
+        sed -i -E "s|^(${key}=\")([^\"]*)\"|\1\2 ${param}\"|" "$file"
     else
         echo "${key}=\"${param}\"" >> "$file"
     fi
@@ -60,8 +60,9 @@ disable_ipv6() {
     log "✅ IPv6 отключен (нужен reboot)"
 }
 
+# --- 2 ---
 setup_certbot_nginx() {
-    log "=== Certbot + Nginx ==="
+    log "=== 2. Certbot + Nginx ==="
 
     export DEBIAN_FRONTEND=noninteractive
 
@@ -70,11 +71,11 @@ setup_certbot_nginx() {
     systemctl stop caddy 2>/dev/null || true
     systemctl disable caddy 2>/dev/null || true
 
-    # --- INSTALL CERTBOT ---
+    # --- INSTALL CERTBOT + NGINX ---
     apt update -y
-    apt install -y certbot python3-certbot-nginx
+    apt install -y certbot python3-certbot-nginx nginx
 
-    # --- STOP NGINX ---
+    # --- STOP NGINX перед standalone ---
     systemctl stop nginx 2>/dev/null || true
 
     # --- DOMAIN ---
@@ -88,8 +89,7 @@ setup_certbot_nginx() {
     certbot certonly --standalone -d "$domain" \
         --non-interactive --agree-tos --email "admin@$domain"
 
-    # --- INSTALL + START NGINX ---
-    apt install -y nginx
+    # --- START NGINX ---
     systemctl start nginx
     systemctl enable nginx
 
@@ -128,10 +128,8 @@ EOF
     nginx -t
     systemctl restart nginx
 
-    log "✅ Готово"
+    log "✅ Certbot + Nginx готово"
 }
-
-
 
 # --- 3 ---
 setup_device_guard() {
@@ -256,8 +254,8 @@ EOFSCRIPT
     log "✅ Cron добавлен: $CRON_JOB"
 
     log "=== ✅ Device Guard установлен ==="
-    log "Скрипт:  $SCRIPT_PATH"
-    log "Лог:     $REMNANODE_LOG_FILE"
+    log "Скрипт:   $SCRIPT_PATH"
+    log "Лог:      $REMNANODE_LOG_FILE"
     log "Проверка: crontab -l | grep device-guard"
 }
 
@@ -277,14 +275,14 @@ setup_ufw() {
     safe_run ufw default allow outgoing
 
     # порты
-    safe_run ufw allow 22
+    # ufw limit уже включает разрешение — отдельный allow 22 не нужен
     safe_run ufw limit 22
     safe_run ufw allow 3001
     safe_run ufw allow 80
     safe_run ufw allow 443
     safe_run ufw allow 1443
 
-    # node exporter доступ только с IP
+    # node exporter — доступ только с конкретного IP
     safe_run ufw allow proto tcp from 193.23.194.101 to any port 9100
 
     safe_run ufw --force enable
