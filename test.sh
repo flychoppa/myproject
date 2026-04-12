@@ -1,383 +1,327 @@
-#!/usr/bin/env bash
-# ==============================================================
-# VPN Node Optimizer — VLESS Reality
-# Автоматически определяет тип сервера (VPS / Dedicated)
-# и применяет только то, что реально работает
-# ==============================================================
-set -euo pipefail
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+LOG_FILE="/var/log/setup-combine.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-log()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn() { echo -e "${YELLOW}[!]${NC} $*"; }
-info() { echo -e "${BLUE}[i]${NC} $*"; }
-sep()  { echo -e "${BOLD}──────────────────────────────────────${NC}"; }
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+trap 'log "❌ Ошибка на строке $LINENO: команда завершилась с кодом $?"' ERR
 
-# ============================================================
-# ОПРЕДЕЛЕНИЕ ОКРУЖЕНИЯ
-# ============================================================
-sep
-info "Определяем конфигурацию сервера..."
-
-DEV=$(ip -o route show default | awk '{print $5}' | head -n1)
-[[ -z "$DEV" ]] && { echo "[-] Не найден сетевой интерфейс"; exit 1; }
-
-NUM_CPU=$(nproc)
-RX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/rx-* 2>/dev/null | wc -l)
-TX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/tx-* 2>/dev/null | wc -l)
-
-# Тип сервера
-if [[ $RX_QUEUES -gt 1 ]]; then
-    SERVER_TYPE="dedicated"
-else
-    SERVER_TYPE="vps"
-fi
-
-# CPU маска — все онлайн ядра
-CPU_MASK=$(python3 -c "
-cpus = open('/sys/devices/system/cpu/online').read().strip()
-mask = 0
-for part in cpus.replace(',', ' ').split():
-    if '-' in part:
-        a, b = map(int, part.split('-'))
-        for i in range(a, b+1): mask |= (1 << i)
-    else:
-        mask |= (1 << int(part))
-print(format(mask, 'x'))
-")
-
-sep
-info "Интерфейс  : ${BOLD}$DEV${NC}"
-info "Тип сервера: ${BOLD}$SERVER_TYPE${NC}"
-info "CPU ядер   : ${BOLD}$NUM_CPU${NC}  (mask: 0x$CPU_MASK)"
-info "RX очередей: ${BOLD}$RX_QUEUES${NC}"
-info "TX очередей: ${BOLD}$TX_QUEUES${NC}"
-sep
-
-# ============================================================
-# ФУНКЦИЯ: RPS (Receive Packet Steering)
-# Нужна ВСЕГДА — распределяет пакеты по CPU в software
-# Особенно важна при 1 аппаратной очереди
-# ============================================================
-apply_rps() {
-    log "RPS: распределение приёма пакетов по CPU..."
-    for q in /sys/class/net/$DEV/queues/rx-*; do
-        printf "%s\n" "$CPU_MASK" > "$q/rps_cpus"
-        info "  $(basename $q)/rps_cpus = $CPU_MASK"
-    done
+# --- SAFE EXEC ---
+safe_run() {
+    "$@" || log "⚠️ Команда завершилась с ошибкой (игнор): $*"
 }
 
-# ============================================================
-# ФУНКЦИЯ: RFS (Receive Flow Steering)
-# Нужна ВСЕГДА — направляет пакеты на CPU где живёт приложение
-# Критично для VPN: снижает cache miss при шифровании
-# ============================================================
-apply_rfs() {
-    log "RFS: steering потоков на CPU приложения..."
-
-    # Глобальный счётчик (степень 2, ≥ числа одновременных соединений)
-    local SOCK_FLOW=32768
-    echo $SOCK_FLOW > /proc/sys/net/core/rps_sock_flow_entries
-    info "  rps_sock_flow_entries = $SOCK_FLOW"
-
-    # На каждую очередь: flow_cnt = total / кол-во очередей, округляем до степени 2
-    local FLOW_CNT
-    FLOW_CNT=$(python3 -c "
-n = $SOCK_FLOW // $RX_QUEUES
-p = 1
-while p < n: p <<= 1
-print(p)
-")
-
-    for q in /sys/class/net/$DEV/queues/rx-*; do
-        printf "%s\n" "$FLOW_CNT" > "$q/rps_flow_cnt"
-        info "  $(basename $q)/rps_flow_cnt = $FLOW_CNT"
-    done
-}
-
-# ============================================================
-# ФУНКЦИЯ: XPS (Transmit Packet Steering)
-# Нужна ТОЛЬКО при >1 TX очереди
-# При 1 очереди — не применяется (просто нечего делить)
-# ============================================================
-apply_xps() {
-    if [[ $TX_QUEUES -le 1 ]]; then
-        warn "XPS: пропускаем — только $TX_QUEUES TX очередь, нет смысла"
-        return
+check_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        log "❌ Запускай от root: sudo ./setup.sh"
+        exit 1
     fi
-
-    log "XPS: привязываем TX очереди к CPU ($TX_QUEUES очередей)..."
-
-    local CPUS_PER_Q=$(( NUM_CPU / TX_QUEUES ))
-    [[ $CPUS_PER_Q -lt 1 ]] && CPUS_PER_Q=1
-
-    local QID=0
-    for q in /sys/class/net/$DEV/queues/tx-*; do
-        local START=$(( QID * CPUS_PER_Q ))
-        local END=$(( START + CPUS_PER_Q - 1 ))
-        [[ $END -ge $NUM_CPU ]] && END=$(( NUM_CPU - 1 ))
-
-        local MASK
-        MASK=$(python3 -c "
-mask = 0
-for i in range($START, $END + 1):
-    mask |= (1 << i)
-print(format(mask, 'x'))
-")
-        printf "%s\n" "$MASK" > "$q/xps_cpus"
-        info "  $(basename $q)/xps_cpus = $MASK  (CPU $START-$END)"
-        QID=$(( QID + 1 ))
-    done
 }
 
-# ============================================================
-# ФУНКЦИЯ: IRQ Affinity
-# VPS (1 очередь)  → irqbalance включён (пусть сам балансирует)
-# Dedicated (N оч) → irqbalance ВЫКЛ, ручная привязка IRQ к CPU
-#                    (irqbalance конфликтует с ручной настройкой)
-# ============================================================
-apply_irq() {
-    apt-get install -y irqbalance -qq 2>/dev/null
-
-    if [[ "$SERVER_TYPE" == "vps" ]]; then
-        log "IRQ: включаем irqbalance (VPS, 1 очередь)"
-        systemctl enable --now irqbalance
-        return
-    fi
-
-    # Dedicated: выключаем irqbalance, вручную привязываем IRQ
-    log "IRQ: dedicated — выключаем irqbalance, ручная привязка..."
-    systemctl stop irqbalance  2>/dev/null || true
-    systemctl disable irqbalance 2>/dev/null || true
-
-    local QID=0
-    # Ищем IRQ по имени интерфейса
-    local IRQS
-    IRQS=$(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
-           | awk -F: '{print $1}' | tr -d ' ' || true)
-
-    if [[ -z "$IRQS" ]]; then
-        warn "  IRQ для $DEV не найдены, пропускаем ручную привязку"
-        return
-    fi
-
-    for IRQ in $IRQS; do
-        local CPU=$(( QID % NUM_CPU ))
-        local CPU_MASK_IRQ=$(python3 -c "print(format(1 << $CPU, 'x'))")
-        echo "$CPU_MASK_IRQ" > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
-        info "  IRQ $IRQ → CPU $CPU"
-        QID=$(( QID + 1 ))
-    done
+backup_file() {
+    local file="$1"
+    local backup="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp -a "$file" "$backup"
+    echo "$backup"
 }
 
-# ============================================================
-# ФУНКЦИЯ: sysctl — применяется ВСЕГДА
-# Самое важное для VPN: буферы, BBR, forwarding, TIME_WAIT
-# ============================================================
-apply_sysctl() {
-    log "sysctl: применяем оптимизации для VPN..."
+append_grub_param() {
+    local file="$1"
+    local key="$2"
+    local param="$3"
 
-    cat > /etc/sysctl.d/99-vpn-node.conf << 'SYSCTL'
-# Сетевые буферы — критично для VPN трафика
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 8388608
-net.core.wmem_default = 8388608
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# Очередь входящих пакетов
-net.core.netdev_max_backlog = 65536
-net.core.somaxconn = 32768
-net.ipv4.tcp_max_syn_backlog = 8192
-
-# TCP оптимизации
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
-
-# Безопасность
-net.ipv4.tcp_syncookies = 1
-net.ipv4.conf.all.rp_filter = 1
-
-# TIME_WAIT: у VPN много коротких соединений
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_tw_buckets = 1440000
-
-# Forwarding — обязателен для VPN роутинга
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-
-# Снижаем задержку
-net.ipv4.tcp_low_latency = 1
-SYSCTL
-
-    sysctl --system -q
-    log "sysctl применён"
-}
-
-# ============================================================
-# ФУНКЦИЯ: BBR
-# ============================================================
-apply_bbr() {
-    log "BBR: проверяем и включаем..."
-    modprobe tcp_bbr 2>/dev/null || true
-    echo tcp_bbr >> /etc/modules-load.d/bbr.conf 2>/dev/null || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr -q
-    sysctl -w net.core.default_qdisc=fq -q
-    local active
-    active=$(sysctl -n net.ipv4.tcp_congestion_control)
-    if [[ "$active" == "bbr" ]]; then
-        log "BBR активен"
+    if grep -Eq "^${key}=" "$file"; then
+        grep -Eq "${param}" "$file" || \
+        sed -i -E "s|^(${key}=\")([^\"]*)\"|\1\2 ${param}\"|" "$file"
     else
-        warn "BBR не поддерживается ядром (активен: $active)"
+        echo "${key}=\"${param}\"" >> "$file"
     fi
 }
 
-# ============================================================
-# СОХРАНЯЕМ НАСТРОЙКИ КАК SYSTEMD СЕРВИС
-# (sysfs сбрасывается при перезагрузке)
-# ============================================================
-install_service() {
-    log "Устанавливаем systemd сервис..."
+# --- 1 ---
+disable_ipv6() {
+    log "=== 1. Отключение IPv6 ==="
 
-    cat > /usr/local/sbin/vpn-netopt.sh << 'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-DEV=$(ip -o route show default | awk '{print $5}' | head -n1)
-RX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/rx-* 2>/dev/null | wc -l)
-TX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/tx-* 2>/dev/null | wc -l)
-NUM_CPU=$(nproc)
+    local grub_file="/etc/default/grub"
+    [[ -f "$grub_file" ]] || { log "❌ grub не найден"; return; }
 
-CPU_MASK=$(python3 -c "
-cpus = open('/sys/devices/system/cpu/online').read().strip()
-mask = 0
-for part in cpus.replace(',', ' ').split():
-    if '-' in part:
-        a, b = map(int, part.split('-'))
-        for i in range(a, b+1): mask |= (1 << i)
-    else:
-        mask |= (1 << int(part))
-print(format(mask, 'x'))
-")
+    local backup
+    backup="$(backup_file "$grub_file")"
+    log "Бэкап: $backup"
 
-# RPS — всегда
-for q in /sys/class/net/$DEV/queues/rx-*; do
-    echo "$CPU_MASK" > "$q/rps_cpus" 2>/dev/null || true
-done
+    append_grub_param "$grub_file" "GRUB_CMDLINE_LINUX_DEFAULT" "ipv6.disable=1"
+    append_grub_param "$grub_file" "GRUB_CMDLINE_LINUX" "ipv6.disable=1"
 
-# RFS — всегда
-SOCK_FLOW=32768
-echo $SOCK_FLOW > /proc/sys/net/core/rps_sock_flow_entries
-FLOW_CNT=$(python3 -c "
-n = $SOCK_FLOW // $RX_QUEUES
-p = 1
-while p < n: p <<= 1
-print(p)
-")
-for q in /sys/class/net/$DEV/queues/rx-*; do
-    echo "$FLOW_CNT" > "$q/rps_flow_cnt" 2>/dev/null || true
-done
+    safe_run update-grub
+    safe_run grub-mkconfig -o /boot/grub/grub.cfg
 
-# XPS — только при >1 TX очереди
-if [[ $TX_QUEUES -gt 1 ]]; then
-    CPUS_PER_Q=$(( NUM_CPU / TX_QUEUES ))
-    [[ $CPUS_PER_Q -lt 1 ]] && CPUS_PER_Q=1
-    QID=0
-    for q in /sys/class/net/$DEV/queues/tx-*; do
-        START=$(( QID * CPUS_PER_Q ))
-        END=$(( START + CPUS_PER_Q - 1 ))
-        [[ $END -ge $NUM_CPU ]] && END=$(( NUM_CPU - 1 ))
-        MASK=$(python3 -c "
-mask = 0
-for i in range($START, $END + 1): mask |= (1 << i)
-print(format(mask, 'x'))
-")
-        echo "$MASK" > "$q/xps_cpus" 2>/dev/null || true
-        QID=$(( QID + 1 ))
-    done
-fi
-
-# IRQ affinity — только при >1 RX очереди
-if [[ $RX_QUEUES -gt 1 ]]; then
-    QID=0
-    for IRQ in $(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
-                 | awk -F: '{print $1}' | tr -d ' ' || true); do
-        CPU=$(( QID % NUM_CPU ))
-        echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
-            > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
-        QID=$(( QID + 1 ))
-    done
-fi
-SCRIPT
-
-    chmod +x /usr/local/sbin/vpn-netopt.sh
-
-    cat > /etc/systemd/system/vpn-netopt.service << 'UNIT'
-[Unit]
-Description=VPN Node Network Optimization (adaptive RPS/RFS/XPS/IRQ)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/vpn-netopt.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    systemctl daemon-reload
-    systemctl enable --now vpn-netopt.service
-    log "Сервис установлен и запущен"
+    log "✅ IPv6 отключен (нужен reboot)"
 }
 
-# ============================================================
-# ЗАПУСК ВСЕХ ФУНКЦИЙ
-# ============================================================
-apply_rps
-apply_rfs
-apply_xps      # умная — сама пропустит при 1 очереди
-apply_irq      # умная — irqbalance или ручная привязка
-apply_sysctl
-apply_bbr
-install_service
+# --- 2 ---
+setup_certbot_nginx() {
+    log "=== 2. Certbot + Nginx ==="
 
-# ============================================================
-# ИТОГОВЫЙ ОТЧЁТ
-# ============================================================
-sep
-echo -e "${BOLD}РЕЗУЛЬТАТ ОПТИМИЗАЦИИ${NC}"
-sep
-echo -e "Сервер      : ${BOLD}$SERVER_TYPE${NC}"
-echo -e "Интерфейс  : ${BOLD}$DEV${NC}"
-echo -e "RX очередей: ${BOLD}$RX_QUEUES${NC}"
-echo -e "TX очередей: ${BOLD}$TX_QUEUES${NC}"
-echo
-echo -e "RPS         : ${GREEN}✓ применён${NC}"
-echo -e "RFS         : ${GREEN}✓ применён${NC}"
-if [[ $TX_QUEUES -gt 1 ]]; then
-    echo -e "XPS         : ${GREEN}✓ применён${NC}"
-else
-    echo -e "XPS         : ${YELLOW}— пропущен (1 TX очередь)${NC}"
-fi
-if [[ "$SERVER_TYPE" == "dedicated" ]]; then
-    echo -e "IRQ affinity: ${GREEN}✓ ручная привязка${NC}"
-    echo -e "irqbalance  : ${YELLOW}— отключён${NC}"
-else
-    echo -e "irqbalance  : ${GREEN}✓ включён${NC}"
-fi
-echo -e "sysctl/BBR  : ${GREEN}✓ применены${NC}"
-sep
-echo "Мониторинг:"
-echo "  watch -n1 'cat /proc/net/softnet_stat | awk \"{print \\$1, \\$2, \\$3}\"'"
-echo "  mpstat -P ALL 1 3"
-echo "  ss -s"
+    export DEBIAN_FRONTEND=noninteractive
+
+    # --- STOP + DISABLE CADDY ---
+    log "Останавливаем Caddy..."
+    systemctl stop caddy 2>/dev/null || true
+    systemctl disable caddy 2>/dev/null || true
+
+    # --- INSTALL CERTBOT + NGINX ---
+    apt update -y
+    apt install -y certbot python3-certbot-nginx nginx
+
+    # --- STOP NGINX перед standalone ---
+    systemctl stop nginx 2>/dev/null || true
+
+    # --- DOMAIN ---
+    read -r -p "Введите домен: " domain
+    if [[ -z "$domain" ]]; then
+        log "❌ Домен не введен"
+        return
+    fi
+
+    # --- SSL ---
+    certbot certonly --standalone -d "$domain" \
+        --non-interactive --agree-tos --email "admin@$domain"
+
+    # --- START NGINX ---
+    systemctl start nginx
+    systemctl enable nginx
+
+    # --- CONFIG ---
+    log "Записываем конфиг nginx..."
+
+    cat > /etc/nginx/sites-available/default <<EOF
+server {
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol;
+    server_name $domain;
+
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+    ssl_session_cache shared:SSL:1m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    real_ip_header proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+    set_real_ip_from ::1;
+
+    root /var/www/site;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+
+    nginx -t
+    systemctl restart nginx
+
+    log "✅ Certbot + Nginx готово"
+}
+
+# --- 3 ---
+setup_device_guard() {
+    log "=== 3. Device Guard (Remnanode → Telegram Bot) ==="
+
+    local BOT_DOMAIN="bots.snowfall.top"
+    local TIME_WINDOW=15
+    local INSTALL_DIR="/opt/device-guard"
+    local SCRIPT_PATH="${INSTALL_DIR}/report.sh"
+    local REMNANODE_LOG_FILE="/var/log/remnanode/access.log"
+    local DOCKER_COMPOSE_FILE="/opt/remnanode/docker-compose.yml"
+
+    # --- Шаг 1: Зависимости ---
+    log "Шаг 1/5: Установка зависимостей (cron, curl, gawk)..."
+    apt-get update -qq
+    apt-get install -y cron curl gawk >/dev/null 2>&1
+    systemctl enable cron >/dev/null 2>&1 || true
+    systemctl start cron >/dev/null 2>&1 || true
+    log "✅ Зависимости готовы"
+
+    # --- Шаг 2: Извлечение SECRET_KEY ---
+    log "Шаг 2/5: Поиск SECRET_KEY в ${DOCKER_COMPOSE_FILE}..."
+
+    if [[ ! -f "$DOCKER_COMPOSE_FILE" ]]; then
+        log "❌ Файл ${DOCKER_COMPOSE_FILE} не найден. Убедитесь, что remnanode установлен в /opt/remnanode/"
+        return 1
+    fi
+
+    local SECRET_KEY
+    SECRET_KEY="$(grep -E 'SECRET_KEY=' "$DOCKER_COMPOSE_FILE" | head -1 | sed -E 's/.*SECRET_KEY=([^"'\''[:space:]]+).*/\1/' | tr -d '\r')"
+
+    if [[ -z "$SECRET_KEY" ]]; then
+        log "❌ SECRET_KEY не найден в ${DOCKER_COMPOSE_FILE}"
+        return 1
+    fi
+
+    log "✅ SECRET_KEY извлечён (${#SECRET_KEY} символов)"
+
+    # --- Шаг 3: Создание директорий ---
+    log "Шаг 3/5: Создание директорий..."
+    mkdir -p "$INSTALL_DIR"
+    mkdir -p /var/log/remnanode
+    touch "$REMNANODE_LOG_FILE"
+    chmod 644 "$REMNANODE_LOG_FILE"
+    chmod -R 777 /var/log/remnanode/
+    log "✅ Директории готовы"
+
+    # --- Шаг 4: Генерация report.sh ---
+    log "Шаг 4/5: Генерация ${SCRIPT_PATH}..."
+
+    cat > "$SCRIPT_PATH" <<EOFSCRIPT
+#!/bin/bash
+# === НАСТРОЙКИ ===
+WEBHOOKS=(
+  "https://${BOT_DOMAIN}/device-report|${SECRET_KEY}"
+)
+TIME_WINDOW=${TIME_WINDOW}
+LOG_FILE="${REMNANODE_LOG_FILE}"
+
+DATA=\$(tail -n 10000 "\$LOG_FILE" 2>/dev/null | \
+  awk -v window="\$TIME_WINDOW" '
+  /email:/ {
+    split(\$1, d, "/")
+    split(\$2, t, ":")
+    split(t[3], sec, ".")
+    ts = mktime(d[1] " " d[2] " " d[3] " " t[1] " " t[2] " " sec[1])
+    match(\$0, /from ([0-9.]+):/, iparr)
+    match(\$0, /email: ([0-9]+)/, emarr)
+    if(iparr[1] && emarr[1]) {
+      n = ++total
+      all_ts[n] = ts
+      all_ip[n] = iparr[1]
+      all_em[n] = emarr[1]
+      if (ts > global_max) global_max = ts
+    }
+  }
+  END {
+    threshold = global_max - window
+    for (i = 1; i <= total; i++) {
+      if (all_ts[i] >= threshold) {
+        em = all_em[i]
+        ip = all_ip[i]
+        key = em SUBSEP ip
+        if (!(key in seen)) {
+          seen[key] = 1
+          users[em] = users[em] ? users[em] ",\"" ip "\"" : "\"" ip "\""
+        }
+      }
+    }
+    printf "{\"ts\":%d,\"users\":{", systime()
+    first = 1
+    for (em in users) {
+      if (!first) printf ","
+      printf "\"%s\":[%s]", em, users[em]
+      first = 0
+    }
+    print "}}"
+  }')
+
+for entry in "\${WEBHOOKS[@]}"; do
+  URL="\${entry%%|*}"
+  KEY="\${entry##*|}"
+  echo "\$DATA" | curl -s -X POST "\$URL" \
+    -H "Content-Type: application/json" \
+    -H "X-Api-Key: \$KEY" \
+    -d @- > /dev/null 2>&1 &
+done
+
+wait
+EOFSCRIPT
+
+    chmod +x "$SCRIPT_PATH"
+    log "✅ Скрипт создан: $SCRIPT_PATH"
+
+    # --- Шаг 5: Cron ---
+    log "Шаг 5/5: Настройка cron (каждые 2 минуты)..."
+    local CRON_JOB="*/2 * * * * $SCRIPT_PATH"
+    (
+        crontab -l 2>/dev/null | grep -F -v "$SCRIPT_PATH" || true
+        echo "$CRON_JOB"
+    ) | crontab -
+    log "✅ Cron добавлен: $CRON_JOB"
+
+    log "=== ✅ Device Guard установлен ==="
+    log "Скрипт:   $SCRIPT_PATH"
+    log "Лог:      $REMNANODE_LOG_FILE"
+    log "Проверка: crontab -l | grep device-guard"
+}
+
+# --- 4 ---
+setup_ufw() {
+    log "=== 4. UFW + Node Exporter ==="
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    safe_run apt update
+    safe_run apt install -y ufw curl
+
+    # reset безопасно
+    safe_run ufw --force reset
+
+    safe_run ufw default deny incoming
+    safe_run ufw default allow outgoing
+
+    # порты
+    # ufw limit уже включает разрешение — отдельный allow 22 не нужен
+    safe_run ufw limit 22
+    safe_run ufw allow 3001
+    safe_run ufw allow 80
+    safe_run ufw allow 443
+    safe_run ufw allow 1443
+
+    # node exporter — доступ только с конкретного IP
+    safe_run ufw allow proto tcp from 193.23.194.101 to any port 9100
+
+    safe_run ufw --force enable
+
+    log "✅ UFW настроен"
+    ufw status verbose || true
+
+    # --- Установка node exporter ---
+    log "=== Установка Node Exporter ==="
+    safe_run bash <(curl -fsSL https://raw.githubusercontent.com/hteppl/sh/master/node_install.sh)
+
+    log "✅ Node Exporter установлен"
+}
+
+# --- MENU ---
+main_menu() {
+    check_root
+    log "=== Setup ==="
+
+    while true; do
+        echo ""
+        echo "1) Отключить IPv6"
+        echo "2) Certbot + Nginx"
+        echo "3) Device Guard"
+        echo "4) UFW + Node Exporter"
+        echo "0) Выход"
+        read -r -p "Выбор: " choice || true
+
+        case "$choice" in
+            1) disable_ipv6 ;;
+            2) setup_certbot_nginx ;;
+            3) setup_device_guard ;;
+            4) setup_ufw ;;
+            0) exit 0 ;;
+            *) log "❌ Неверный пункт" ;;
+        esac
+
+        read -r -p "Enter для продолжения..." || true
+    done
+}
+
+main_menu "$@"
