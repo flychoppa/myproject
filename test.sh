@@ -450,9 +450,11 @@ print(format(mask, 'x'))
     log "Интерфейс: $DEV | Тип: $SERVER_TYPE | CPU: $NUM_CPU | RX: $RX_QUEUES | TX: $TX_QUEUES | IRQ активных: $IRQ_SPREAD"
 
     # --- RPS/RFS ---
+    # Применяем если: 1 очередь ИЛИ много очередей но IRQ не размазаны по CPU
     if [[ $RX_QUEUES -le 1 ]] || [[ $IRQ_SPREAD -le 2 ]]; then
-        [[ $RX_QUEUES -le 1 ]] && log "1 очередь NIC → включаем RPS/RFS" || \
-                                   log "IRQ не привязаны → включаем RPS/RFS"
+        [[ $RX_QUEUES -le 1 ]] \
+            && log "1 очередь NIC → включаем RPS/RFS" \
+            || log "IRQ не привязаны → включаем RPS/RFS"
         for q in /sys/class/net/$DEV/queues/rx-*; do
             printf "%s\n" "$CPU_MASK" > "$q/rps_cpus"
         done
@@ -472,23 +474,18 @@ print(p)")
     fi
 
     # --- XPS ---
+    # round-robin: каждая TX очередь → свой CPU по кругу
+    # избегаем переполнения маски при большом числе очередей
     if [[ $TX_QUEUES -gt 1 ]]; then
-        local CPUS_PER_Q=$(( NUM_CPU / TX_QUEUES ))
-        [[ $CPUS_PER_Q -lt 1 ]] && CPUS_PER_Q=1
         local QID=0
         for q in /sys/class/net/$DEV/queues/tx-*; do
-            local START=$(( QID * CPUS_PER_Q ))
-            local END=$(( START + CPUS_PER_Q - 1 ))
-            [[ $END -ge $NUM_CPU ]] && END=$(( NUM_CPU - 1 ))
+            local CPU=$(( QID % NUM_CPU ))
             local MASK
-            MASK=$(python3 -c "
-mask = 0
-for i in range($START, $END + 1): mask |= (1 << i)
-print(format(mask, 'x'))")
-            printf "%s\n" "$MASK" > "$q/xps_cpus"
+            MASK=$(python3 -c "print(format(1 << $CPU, 'x'))")
+            printf "%s\n" "$MASK" > "$q/xps_cpus" 2>/dev/null || true
             QID=$(( QID + 1 ))
         done
-        log "✅ XPS применён ($TX_QUEUES TX очередей)"
+        log "✅ XPS применён ($TX_QUEUES TX очередей, round-robin по $NUM_CPU CPU)"
     else
         log "⚠️ XPS пропущен — только 1 TX очередь"
     fi
@@ -501,10 +498,21 @@ print(format(mask, 'x'))")
     else
         systemctl stop irqbalance 2>/dev/null || true
         systemctl disable irqbalance 2>/dev/null || true
+        log "✅ irqbalance отключён (dedicated)"
+
         local QID=0
-        local IRQS
+        local IRQS=""
+
+        # Сначала ищем по имени интерфейса (реальные NIC: eno1, eth0)
         IRQS=$(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
                | awk -F: '{print $1}' | tr -d ' ' || true)
+
+        # Если не нашли — ищем virtio-input (KVM/virtio_net)
+        if [[ -z "$IRQS" ]]; then
+            IRQS=$(grep -E "virtio[0-9]+-input" /proc/interrupts 2>/dev/null \
+                   | awk -F: '{print $1}' | tr -d ' ' || true)
+        fi
+
         if [[ -n "$IRQS" ]]; then
             for IRQ in $IRQS; do
                 local CPU=$(( QID % NUM_CPU ))
@@ -512,9 +520,9 @@ print(format(mask, 'x'))")
                     > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
                 QID=$(( QID + 1 ))
             done
-            log "✅ IRQ привязаны вручную (dedicated)"
+            log "✅ IRQ привязаны вручную ($QID очередей → $NUM_CPU CPU)"
         else
-            log "⚠️ IRQ для $DEV не найдены"
+            log "⚠️ IRQ не найдены — гипервизор управляет сам"
         fi
     fi
 
@@ -526,7 +534,7 @@ print(format(mask, 'x'))")
     safe_run sysctl -w net.core.default_qdisc=fq -q
     log "✅ BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"
 
-    # --- Systemd сервис ---
+    # --- Systemd сервис (та же логика, применяется при перезагрузке) ---
     cat > /usr/local/sbin/vpn-netopt.sh << 'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -534,6 +542,7 @@ DEV=$(ip -o route show default | awk '{print $5}' | head -n1)
 RX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/rx-* 2>/dev/null | wc -l)
 TX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/tx-* 2>/dev/null | wc -l)
 NUM_CPU=$(nproc)
+
 CPU_MASK=$(python3 -c "
 cpus = open('/sys/devices/system/cpu/online').read().strip()
 mask = 0
@@ -545,9 +554,11 @@ for part in cpus.replace(',', ' ').split():
         mask |= (1 << int(part))
 print(format(mask, 'x'))
 ")
+
 IRQ_SPREAD=$(grep -E "${DEV}|virtio" /proc/interrupts 2>/dev/null | \
     awk '{for(i=2;i<=NF-3;i++) if($i+0>1000) count++} END{print count+0}')
 
+# RPS/RFS
 if [[ $RX_QUEUES -le 1 ]] || [[ $IRQ_SPREAD -le 2 ]]; then
     for q in /sys/class/net/$DEV/queues/rx-*; do
         echo "$CPU_MASK" > "$q/rps_cpus" 2>/dev/null || true
@@ -563,32 +574,38 @@ print(p)")
     done
 fi
 
+# XPS — round-robin, избегаем переполнения маски
 if [[ $TX_QUEUES -gt 1 ]]; then
-    CPUS_PER_Q=$(( NUM_CPU / TX_QUEUES ))
-    [[ $CPUS_PER_Q -lt 1 ]] && CPUS_PER_Q=1
     QID=0
     for q in /sys/class/net/$DEV/queues/tx-*; do
-        START=$(( QID * CPUS_PER_Q ))
-        END=$(( START + CPUS_PER_Q - 1 ))
-        [[ $END -ge $NUM_CPU ]] && END=$(( NUM_CPU - 1 ))
-        MASK=$(python3 -c "
-mask = 0
-for i in range($START, $END + 1): mask |= (1 << i)
-print(format(mask, 'x'))")
+        CPU=$(( QID % NUM_CPU ))
+        MASK=$(python3 -c "print(format(1 << $CPU, 'x'))")
         echo "$MASK" > "$q/xps_cpus" 2>/dev/null || true
         QID=$(( QID + 1 ))
     done
 fi
 
+# IRQ affinity — только dedicated
 if [[ $RX_QUEUES -gt 1 ]]; then
     QID=0
-    for IRQ in $(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
-                 | awk -F: '{print $1}' | tr -d ' ' || true); do
-        CPU=$(( QID % NUM_CPU ))
-        echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
-            > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
-        QID=$(( QID + 1 ))
-    done
+    IRQS=""
+
+    IRQS=$(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
+           | awk -F: '{print $1}' | tr -d ' ' || true)
+
+    if [[ -z "$IRQS" ]]; then
+        IRQS=$(grep -E "virtio[0-9]+-input" /proc/interrupts 2>/dev/null \
+               | awk -F: '{print $1}' | tr -d ' ' || true)
+    fi
+
+    if [[ -n "$IRQS" ]]; then
+        for IRQ in $IRQS; do
+            CPU=$(( QID % NUM_CPU ))
+            echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
+                > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
+            QID=$(( QID + 1 ))
+        done
+    fi
 fi
 SCRIPT
 
@@ -615,76 +632,75 @@ UNIT
     log "=== ✅ VPN Net Optimizer установлен ==="
 }
 
-# --- 7 ---
+    # --- 7 ---
 setup_cron_restart() {
-    log "=== 7. Cron: еженедельный перезапуск VPN ноды ==="
+    log "=== 7. Cron: еженедельная перезагрузка сервера + обновления ==="
 
-    # --- Шаг 1: синхронизация времени ---
-    log "Шаг 1/3: настройка NTP..."
+    # --- Шаг 1: NTP ---
+    log "Шаг 1/4: настройка NTP..."
     safe_run apt-get install -y chrony -qq
     systemctl enable --now chrony
     chronyc makestep 2>/dev/null || true
     log "✅ Время синхронизировано: $(date -u '+%Y-%m-%d %H:%M:%S UTC') (МСК: $(date -d '+3 hours' -u '+%H:%M'))"
 
-    # --- Шаг 2: определяем сервис ---
-    log "Шаг 2/3: ищем VPN сервис..."
-    local VPN_SVC=""
-    for svc in rw-core xray sing-box v2ray; do
-        if systemctl cat "$svc" &>/dev/null; then
-            VPN_SVC="$svc"
-            log "✅ Найден сервис: $VPN_SVC"
-            break
-        fi
-    done
+    # --- Шаг 2: unattended-upgrades ---
+    log "Шаг 2/4: настройка автообновлений..."
+    safe_run apt-get install -y unattended-upgrades -qq
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+    log "✅ Автообновления настроены"
 
-    if [[ -z "$VPN_SVC" ]]; then
-        log "⚠️ VPN сервис не найден автоматически"
-        read -r -p "Введи имя сервиса вручную (или Enter для пропуска): " VPN_SVC || true
-        [[ -z "$VPN_SVC" ]] && { log "❌ Сервис не указан, пропускаем"; return; }
-    fi
+    # --- Шаг 3: скрипт перезагрузки ---
+    log "Шаг 3/4: создаём скрипт перезагрузки..."
 
-    # --- Шаг 3: скрипт перезапуска ---
-    log "Шаг 3/3: создаём скрипт и cron..."
-
-    cat > /usr/local/sbin/vpn-weekly-restart.sh << SCRIPT
+    cat > /usr/local/sbin/vpn-weekly-reboot.sh << 'SCRIPT'
 #!/usr/bin/env bash
-# Еженедельный перезапуск VPN ноды
+# Еженедельная перезагрузка сервера
 # Воскресенье 4:00 МСК = воскресенье 01:00 UTC
-LOG="/var/log/vpn-restart.log"
-SVC="${VPN_SVC}"
+LOG="/var/log/vpn-reboot.log"
 
-echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] Перезапуск \$SVC..." >> "\$LOG"
+echo "[$(date '+%Y-%m-%d %H:%M:%S UTC')] === Еженедельная перезагрузка ===" >> "$LOG"
 
-systemctl restart "\$SVC"
-STATUS=\$?
+# Применяем все доступные обновления перед перезагрузкой
+echo "[$(date '+%Y-%m-%d %H:%M:%S UTC')] Обновление пакетов..." >> "$LOG"
+DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "$LOG" 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" >> "$LOG" 2>&1 || true
 
-if [[ \$STATUS -eq 0 ]]; then
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] ✅ \$SVC перезапущен успешно" >> "\$LOG"
-else
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] ❌ Ошибка перезапуска \$SVC (код: \$STATUS)" >> "\$LOG"
-fi
+echo "[$(date '+%Y-%m-%d %H:%M:%S UTC')] Уходим на перезагрузку..." >> "$LOG"
 
-# Оставляем только последние 100 строк лога
-tail -n 100 "\$LOG" > "\${LOG}.tmp" && mv "\${LOG}.tmp" "\$LOG"
+# Оставляем только последние 200 строк лога
+tail -n 200 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+
+# Перезагрузка
+/sbin/shutdown -r now "Плановая еженедельная перезагрузка"
 SCRIPT
 
-    chmod +x /usr/local/sbin/vpn-weekly-restart.sh
+    chmod +x /usr/local/sbin/vpn-weekly-reboot.sh
 
-    # 01:00 UTC воскресенье = 04:00 МСК воскресенье
-    local CRON_JOB="0 1 * * 0 root /usr/local/sbin/vpn-weekly-restart.sh"
+    # --- Шаг 4: cron ---
+    log "Шаг 4/4: устанавливаем cron..."
 
-    # Убираем старый если есть
-    rm -f /etc/cron.d/vpn-weekly-restart
+    # Крон всегда в UTC — 01:00 UTC = 04:00 МСК, независимо от timezone сервера
+    rm -f /etc/cron.d/vpn-weekly-reboot
+    cat > /etc/cron.d/vpn-weekly-reboot << 'EOF'
+# Еженедельная перезагрузка: воскресенье 04:00 МСК = 01:00 UTC
+# Крон работает в UTC — timezone сервера не важна
+0 1 * * 0 root /usr/local/sbin/vpn-weekly-reboot.sh
+EOF
+    chmod 644 /etc/cron.d/vpn-weekly-reboot
 
-    echo "$CRON_JOB" > /etc/cron.d/vpn-weekly-restart
-    chmod 644 /etc/cron.d/vpn-weekly-restart
-
-    log "=== ✅ Cron установлен ==="
-    log "Сервис    : $VPN_SVC"
-    log "Расписание: каждое воскресенье 04:00 МСК (01:00 UTC)"
-    log "Скрипт    : /usr/local/sbin/vpn-weekly-restart.sh"
-    log "Лог       : /var/log/vpn-restart.log"
-    log "Проверка  : crontab -l 2>/dev/null; cat /etc/cron.d/vpn-weekly-restart"
+    log "=== ✅ Еженедельная перезагрузка настроена ==="
+    log "Расписание : каждое воскресенье 04:00 МСК (01:00 UTC)"
+    log "Скрипт     : /usr/local/sbin/vpn-weekly-reboot.sh"
+    log "Лог        : /var/log/vpn-reboot.log"
+    log "Проверка   : cat /etc/cron.d/vpn-weekly-reboot"
+    log "⚠️  Сервер будет полностью перезагружаться каждое воскресенье в 04:00 МСК"
 }
 
 # --- MENU ---
