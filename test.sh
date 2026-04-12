@@ -452,6 +452,275 @@ PYEOF
     log "⚠️  Перезапусти сервисы: systemctl restart nginx xray 2>/dev/null || true"
 }
 
+# --- 6 ---
+setup_net_optimizer() {
+    log "=== 6. VPN Net Optimizer (RPS/RFS/XPS/IRQ/BBR) ==="
+
+    local DEV NUM_CPU RX_QUEUES TX_QUEUES SERVER_TYPE CPU_MASK IRQ_SPREAD
+
+    DEV=$(ip -o route show default | awk '{print $5}' | head -n1)
+    [[ -z "$DEV" ]] && { log "❌ Не найден сетевой интерфейс"; return; }
+
+    NUM_CPU=$(nproc)
+    RX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/rx-* 2>/dev/null | wc -l)
+    TX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/tx-* 2>/dev/null | wc -l)
+    SERVER_TYPE=$([[ $RX_QUEUES -gt 1 ]] && echo "dedicated" || echo "vps")
+
+    CPU_MASK=$(python3 -c "
+cpus = open('/sys/devices/system/cpu/online').read().strip()
+mask = 0
+for part in cpus.replace(',', ' ').split():
+    if '-' in part:
+        a, b = map(int, part.split('-'))
+        for i in range(a, b+1): mask |= (1 << i)
+    else:
+        mask |= (1 << int(part))
+print(format(mask, 'x'))
+")
+
+    IRQ_SPREAD=$(grep -E "${DEV}|virtio" /proc/interrupts 2>/dev/null | \
+        awk '{for(i=2;i<=NF-3;i++) if($i+0>1000) count++} END{print count+0}')
+
+    log "Интерфейс: $DEV | Тип: $SERVER_TYPE | CPU: $NUM_CPU | RX: $RX_QUEUES | TX: $TX_QUEUES | IRQ активных: $IRQ_SPREAD"
+
+    # --- RPS/RFS ---
+    if [[ $RX_QUEUES -le 1 ]] || [[ $IRQ_SPREAD -le 2 ]]; then
+        [[ $RX_QUEUES -le 1 ]] && log "1 очередь NIC → включаем RPS/RFS" || \
+                                   log "IRQ не привязаны → включаем RPS/RFS"
+        for q in /sys/class/net/$DEV/queues/rx-*; do
+            printf "%s\n" "$CPU_MASK" > "$q/rps_cpus"
+        done
+        echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+        local FLOW_CNT
+        FLOW_CNT=$(python3 -c "
+n = 32768 // $RX_QUEUES
+p = 1
+while p < n: p <<= 1
+print(p)")
+        for q in /sys/class/net/$DEV/queues/rx-*; do
+            printf "%s\n" "$FLOW_CNT" > "$q/rps_flow_cnt"
+        done
+        log "✅ RPS/RFS применён"
+    else
+        log "⚠️ RPS/RFS пропущен — $RX_QUEUES очередей, IRQ уже на $IRQ_SPREAD CPU"
+    fi
+
+    # --- XPS ---
+    if [[ $TX_QUEUES -gt 1 ]]; then
+        local CPUS_PER_Q=$(( NUM_CPU / TX_QUEUES ))
+        [[ $CPUS_PER_Q -lt 1 ]] && CPUS_PER_Q=1
+        local QID=0
+        for q in /sys/class/net/$DEV/queues/tx-*; do
+            local START=$(( QID * CPUS_PER_Q ))
+            local END=$(( START + CPUS_PER_Q - 1 ))
+            [[ $END -ge $NUM_CPU ]] && END=$(( NUM_CPU - 1 ))
+            local MASK
+            MASK=$(python3 -c "
+mask = 0
+for i in range($START, $END + 1): mask |= (1 << i)
+print(format(mask, 'x'))")
+            printf "%s\n" "$MASK" > "$q/xps_cpus"
+            QID=$(( QID + 1 ))
+        done
+        log "✅ XPS применён ($TX_QUEUES TX очередей)"
+    else
+        log "⚠️ XPS пропущен — только 1 TX очередь"
+    fi
+
+    # --- IRQ ---
+    safe_run apt-get install -y irqbalance -qq
+    if [[ "$SERVER_TYPE" == "vps" ]]; then
+        systemctl enable --now irqbalance
+        log "✅ irqbalance включён (VPS)"
+    else
+        systemctl stop irqbalance 2>/dev/null || true
+        systemctl disable irqbalance 2>/dev/null || true
+        local QID=0
+        local IRQS
+        IRQS=$(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
+               | awk -F: '{print $1}' | tr -d ' ' || true)
+        if [[ -n "$IRQS" ]]; then
+            for IRQ in $IRQS; do
+                local CPU=$(( QID % NUM_CPU ))
+                echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
+                    > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
+                QID=$(( QID + 1 ))
+            done
+            log "✅ IRQ привязаны вручную (dedicated)"
+        else
+            log "⚠️ IRQ для $DEV не найдены"
+        fi
+    fi
+
+    # --- BBR ---
+    modprobe tcp_bbr 2>/dev/null || true
+    grep -q tcp_bbr /etc/modules-load.d/bbr.conf 2>/dev/null || \
+        echo tcp_bbr >> /etc/modules-load.d/bbr.conf
+    safe_run sysctl -w net.ipv4.tcp_congestion_control=bbr -q
+    safe_run sysctl -w net.core.default_qdisc=fq -q
+    log "✅ BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"
+
+    # --- Systemd сервис ---
+    cat > /usr/local/sbin/vpn-netopt.sh << 'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+DEV=$(ip -o route show default | awk '{print $5}' | head -n1)
+RX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/rx-* 2>/dev/null | wc -l)
+TX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/tx-* 2>/dev/null | wc -l)
+NUM_CPU=$(nproc)
+CPU_MASK=$(python3 -c "
+cpus = open('/sys/devices/system/cpu/online').read().strip()
+mask = 0
+for part in cpus.replace(',', ' ').split():
+    if '-' in part:
+        a, b = map(int, part.split('-'))
+        for i in range(a, b+1): mask |= (1 << i)
+    else:
+        mask |= (1 << int(part))
+print(format(mask, 'x'))
+")
+IRQ_SPREAD=$(grep -E "${DEV}|virtio" /proc/interrupts 2>/dev/null | \
+    awk '{for(i=2;i<=NF-3;i++) if($i+0>1000) count++} END{print count+0}')
+
+if [[ $RX_QUEUES -le 1 ]] || [[ $IRQ_SPREAD -le 2 ]]; then
+    for q in /sys/class/net/$DEV/queues/rx-*; do
+        echo "$CPU_MASK" > "$q/rps_cpus" 2>/dev/null || true
+    done
+    echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+    FLOW_CNT=$(python3 -c "
+n = 32768 // $RX_QUEUES
+p = 1
+while p < n: p <<= 1
+print(p)")
+    for q in /sys/class/net/$DEV/queues/rx-*; do
+        echo "$FLOW_CNT" > "$q/rps_flow_cnt" 2>/dev/null || true
+    done
+fi
+
+if [[ $TX_QUEUES -gt 1 ]]; then
+    CPUS_PER_Q=$(( NUM_CPU / TX_QUEUES ))
+    [[ $CPUS_PER_Q -lt 1 ]] && CPUS_PER_Q=1
+    QID=0
+    for q in /sys/class/net/$DEV/queues/tx-*; do
+        START=$(( QID * CPUS_PER_Q ))
+        END=$(( START + CPUS_PER_Q - 1 ))
+        [[ $END -ge $NUM_CPU ]] && END=$(( NUM_CPU - 1 ))
+        MASK=$(python3 -c "
+mask = 0
+for i in range($START, $END + 1): mask |= (1 << i)
+print(format(mask, 'x'))")
+        echo "$MASK" > "$q/xps_cpus" 2>/dev/null || true
+        QID=$(( QID + 1 ))
+    done
+fi
+
+if [[ $RX_QUEUES -gt 1 ]]; then
+    QID=0
+    for IRQ in $(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
+                 | awk -F: '{print $1}' | tr -d ' ' || true); do
+        CPU=$(( QID % NUM_CPU ))
+        echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
+            > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
+        QID=$(( QID + 1 ))
+    done
+fi
+SCRIPT
+
+    chmod +x /usr/local/sbin/vpn-netopt.sh
+
+    cat > /etc/systemd/system/vpn-netopt.service << 'UNIT'
+[Unit]
+Description=VPN Node Network Optimization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-netopt.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now vpn-netopt.service
+
+    log "=== ✅ VPN Net Optimizer установлен ==="
+}
+
+# --- 7 ---
+setup_cron_restart() {
+    log "=== 7. Cron: еженедельный перезапуск VPN ноды ==="
+
+    # --- Шаг 1: синхронизация времени ---
+    log "Шаг 1/3: настройка NTP..."
+    safe_run apt-get install -y chrony -qq
+    systemctl enable --now chrony
+    chronyc makestep 2>/dev/null || true
+    log "✅ Время синхронизировано: $(date -u '+%Y-%m-%d %H:%M:%S UTC') (МСК: $(date -d '+3 hours' -u '+%H:%M'))"
+
+    # --- Шаг 2: определяем сервис ---
+    log "Шаг 2/3: ищем VPN сервис..."
+    local VPN_SVC=""
+    for svc in rw-core xray sing-box v2ray; do
+        if systemctl cat "$svc" &>/dev/null; then
+            VPN_SVC="$svc"
+            log "✅ Найден сервис: $VPN_SVC"
+            break
+        fi
+    done
+
+    if [[ -z "$VPN_SVC" ]]; then
+        log "⚠️ VPN сервис не найден автоматически"
+        read -r -p "Введи имя сервиса вручную (или Enter для пропуска): " VPN_SVC || true
+        [[ -z "$VPN_SVC" ]] && { log "❌ Сервис не указан, пропускаем"; return; }
+    fi
+
+    # --- Шаг 3: скрипт перезапуска ---
+    log "Шаг 3/3: создаём скрипт и cron..."
+
+    cat > /usr/local/sbin/vpn-weekly-restart.sh << SCRIPT
+#!/usr/bin/env bash
+# Еженедельный перезапуск VPN ноды
+# Воскресенье 4:00 МСК = воскресенье 01:00 UTC
+LOG="/var/log/vpn-restart.log"
+SVC="${VPN_SVC}"
+
+echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] Перезапуск \$SVC..." >> "\$LOG"
+
+systemctl restart "\$SVC"
+STATUS=\$?
+
+if [[ \$STATUS -eq 0 ]]; then
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] ✅ \$SVC перезапущен успешно" >> "\$LOG"
+else
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] ❌ Ошибка перезапуска \$SVC (код: \$STATUS)" >> "\$LOG"
+fi
+
+# Оставляем только последние 100 строк лога
+tail -n 100 "\$LOG" > "\${LOG}.tmp" && mv "\${LOG}.tmp" "\$LOG"
+SCRIPT
+
+    chmod +x /usr/local/sbin/vpn-weekly-restart.sh
+
+    # 01:00 UTC воскресенье = 04:00 МСК воскресенье
+    local CRON_JOB="0 1 * * 0 root /usr/local/sbin/vpn-weekly-restart.sh"
+
+    # Убираем старый если есть
+    rm -f /etc/cron.d/vpn-weekly-restart
+
+    echo "$CRON_JOB" > /etc/cron.d/vpn-weekly-restart
+    chmod 644 /etc/cron.d/vpn-weekly-restart
+
+    log "=== ✅ Cron установлен ==="
+    log "Сервис    : $VPN_SVC"
+    log "Расписание: каждое воскресенье 04:00 МСК (01:00 UTC)"
+    log "Скрипт    : /usr/local/sbin/vpn-weekly-restart.sh"
+    log "Лог       : /var/log/vpn-restart.log"
+    log "Проверка  : crontab -l 2>/dev/null; cat /etc/cron.d/vpn-weekly-restart"
+}
+
 # --- MENU ---
 main_menu() {
     check_root
@@ -464,6 +733,8 @@ main_menu() {
         echo "3) Device Guard"
         echo "4) UFW + Node Exporter"
         echo "5) VPN Limits (conntrack / sysctl / ulimit)"
+        echo "6) VPN Net Optimizer (RPS/RFS/XPS/IRQ/BBR)"
+        echo "7) Cron: еженедельный перезапуск VPN (04:00 МСК)"
         echo "0) Выход"
         read -r -p "Выбор: " choice || true
 
@@ -473,6 +744,8 @@ main_menu() {
             3) setup_device_guard ;;
             4) setup_ufw ;;
             5) setup_vpn_limits ;;
+            6) setup_net_optimizer ;;
+            7) setup_cron_restart ;;
             0) exit 0 ;;
             *) log "❌ Неверный пункт" ;;
         esac
