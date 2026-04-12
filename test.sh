@@ -297,6 +297,161 @@ setup_ufw() {
     log "✅ Node Exporter установлен"
 }
 
+# --- 5 ---
+setup_vpn_limits() {
+    log "=== 5. VPN Limits (conntrack, sysctl, ulimit, systemd) ==="
+
+    # --- RAM → conntrack max ---
+    RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    if   [[ $RAM_MB -ge 16000 ]]; then CT_MAX=2097152
+    elif [[ $RAM_MB -ge  8000 ]]; then CT_MAX=1048576
+    elif [[ $RAM_MB -ge  4000 ]]; then CT_MAX=524288
+    else                                CT_MAX=262144
+    fi
+    CT_BUCKETS=$((CT_MAX / 4))
+    log "RAM: ${RAM_MB}MB → conntrack max: ${CT_MAX}"
+
+    # --- sysctl (zzz- чтобы быть последним) ---
+    log "Шаг 1/4: sysctl..."
+    cat > /etc/sysctl.d/zzz-vpn-limits.conf << EOF
+net.netfilter.nf_conntrack_max = ${CT_MAX}
+net.netfilter.nf_conntrack_buckets = ${CT_BUCKETS}
+net.netfilter.nf_conntrack_tcp_timeout_established = 1800
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 15
+net.core.somaxconn = 65536
+net.ipv4.tcp_max_syn_backlog = 65536
+net.core.netdev_max_backlog = 65536
+net.core.netdev_budget = 1000
+net.core.netdev_budget_usecs = 8000
+net.ipv4.ip_local_port_range = 1024 65535
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_orphans = 524288
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+
+    # Применяем принудительно напрямую — минуя порядок файлов
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        key=$(echo "$line" | cut -d= -f1 | tr -d ' ')
+        val=$(echo "$line" | cut -d= -f2- | tr -d ' ')
+        sysctl -w "$key=$val" -q 2>/dev/null || \
+            log "⚠️ Не применился: $key"
+    done < /etc/sysctl.d/zzz-vpn-limits.conf
+    log "✅ sysctl применён"
+
+    # --- BBR ---
+    log "Шаг 2/4: BBR..."
+    modprobe tcp_bbr 2>/dev/null || true
+    grep -q tcp_bbr /etc/modules-load.d/bbr.conf 2>/dev/null || \
+        echo tcp_bbr >> /etc/modules-load.d/bbr.conf
+    safe_run sysctl -w net.ipv4.tcp_congestion_control=bbr -q
+    safe_run sysctl -w net.core.default_qdisc=fq -q
+    log "✅ BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"
+
+    # --- ulimit ---
+    log "Шаг 3/4: ulimit..."
+    grep -q "nofile 1048576" /etc/security/limits.conf 2>/dev/null || \
+    cat >> /etc/security/limits.conf << 'LIMITS'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+LIMITS
+
+    grep -q "pam_limits" /etc/pam.d/common-session 2>/dev/null || \
+        echo "session required pam_limits.so" >> /etc/pam.d/common-session
+    log "✅ ulimit (вступит после переподключения)"
+
+    # --- systemd LimitNOFILE ---
+    log "Шаг 4/4: systemd лимиты..."
+    for svc in nginx xray sing-box v2ray rw-core haproxy; do
+        systemctl cat "$svc" &>/dev/null || continue
+        mkdir -p "/etc/systemd/system/${svc}.service.d"
+        cat > "/etc/systemd/system/${svc}.service.d/limits.conf" << 'UNIT'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=524288
+UNIT
+        log "  ✅ $svc → LimitNOFILE=1048576"
+    done
+    safe_run systemctl daemon-reload
+
+    # --- Итоговая проверка ---
+    log "=== Проверка ==="
+    python3 - << 'PYEOF'
+import subprocess
+
+def sctl(k):
+    try: return subprocess.check_output(['sysctl','-n',k],text=True).strip()
+    except: return "н/д"
+
+def r(f):
+    try: return open(f).read().strip()
+    except: return "н/д"
+
+checks = [
+    ("conntrack",           lambda: f"{int(r('/proc/sys/net/netfilter/nf_conntrack_count')):,} / {int(r('/proc/sys/net/netfilter/nf_conntrack_max')):,}", lambda v: int(v.split('/')[0].replace(',',''))*100//int(v.split('/')[1].replace(',','')) < 80),
+    ("somaxconn",           lambda: sctl('net.core.somaxconn'),                  lambda v: int(v) >= 8192),
+    ("ip_local_port_range", lambda: sctl('net.ipv4.ip_local_port_range'),        lambda v: int(v.split()[1])-int(v.split()[0]) >= 40000),
+    ("rmem_max",            lambda: f"{int(sctl('net.core.rmem_max')):,}",       lambda v: int(v.replace(',','')) >= 16777216),
+    ("tcp_keepalive_time",  lambda: sctl('net.ipv4.tcp_keepalive_time'),         lambda v: int(v) <= 300),
+    ("tcp_fin_timeout",     lambda: sctl('net.ipv4.tcp_fin_timeout'),            lambda v: int(v) <= 30),
+    ("netdev_max_backlog",  lambda: sctl('net.core.netdev_max_backlog'),         lambda v: int(v) >= 16384),
+    ("bbr",                 lambda: sctl('net.ipv4.tcp_congestion_control'),     lambda v: v == 'bbr'),
+]
+
+print(f"{'Параметр':<24} {'Значение':<28} Статус")
+print("─" * 64)
+for name, getter, ok_fn in checks:
+    try:
+        val = getter()
+        ok = ok_fn(val)
+        print(f"{'✓' if ok else '✗'} {name:<22} {val:<28} {'ОК' if ok else 'ОПАСНО'}")
+    except:
+        print(f"? {name:<22} {'ошибка':<28}")
+
+print()
+print("Лимиты процессов:")
+import os
+for name in ['rw-core','nginx','xray','sing-box','haproxy']:
+    try:
+        pid = subprocess.check_output(['pgrep','-o',name],text=True).strip()
+        limit = [l for l in open(f'/proc/{pid}/limits').readlines() if 'open files' in l][0].split()[3]
+        ok = int(limit) >= 65536
+        print(f"  {'✓' if ok else '✗'} {name} (PID {pid}): nofile = {limit}")
+    except:
+        pass
+PYEOF
+
+    log "=== ✅ VPN Limits установлены ==="
+    log "⚠️  ulimit для SSH вступит после переподключения"
+    log "⚠️  Перезапусти сервисы: systemctl restart nginx xray 2>/dev/null || true"
+}
+
 # --- MENU ---
 main_menu() {
     check_root
@@ -308,6 +463,7 @@ main_menu() {
         echo "2) Certbot + Nginx"
         echo "3) Device Guard"
         echo "4) UFW + Node Exporter"
+        echo "5) VPN Limits (conntrack / sysctl / ulimit)"
         echo "0) Выход"
         read -r -p "Выбор: " choice || true
 
@@ -316,6 +472,7 @@ main_menu() {
             2) setup_certbot_nginx ;;
             3) setup_device_guard ;;
             4) setup_ufw ;;
+            5) setup_vpn_limits ;;
             0) exit 0 ;;
             *) log "❌ Неверный пункт" ;;
         esac
