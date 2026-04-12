@@ -702,6 +702,7 @@ EOF
     log "Проверка   : cat /etc/cron.d/vpn-weekly-reboot"
     log "⚠️  Сервер будет полностью перезагружаться каждое воскресенье в 04:00 МСК"
 }
+
 # --- 8 ---
 setup_net_admin() {
     log "=== 8. NET_ADMIN: добавляем cap_add в remnanode ==="
@@ -725,14 +726,23 @@ setup_net_admin() {
     cp "$COMPOSE_FILE" "$BACKUP"
     log "📦 Бэкап создан: $BACKUP"
 
-    # --- Вставляем cap_add после restart: always ---
+    # --- Вставляем cap_add с правильным отступом ---
     python3 - << EOF
 import re, sys
 
 with open('$COMPOSE_FILE', 'r') as f:
     content = f.read()
 
-insert = "    cap_add:\n      - NET_ADMIN\n"
+# Определяем реальный отступ строки restart: always
+match = re.search(r'^([ \t]*)restart:\s*always', content, re.MULTILINE)
+if not match:
+    print("❌ Строка 'restart: always' не найдена, файл не изменён")
+    sys.exit(1)
+
+indent = match.group(1)
+
+# Вставляем с тем же отступом что и restart: always
+insert = f"{indent}cap_add:\n{indent}  - NET_ADMIN\n"
 
 new_content = re.sub(
     r'([ \t]*restart:\s*always\n)',
@@ -742,7 +752,7 @@ new_content = re.sub(
 )
 
 if new_content == content:
-    print("❌ Строка 'restart: always' не найдена, файл не изменён")
+    print("❌ Не удалось вставить, файл не изменён")
     sys.exit(1)
 
 with open('$COMPOSE_FILE', 'w') as f:
@@ -763,6 +773,14 @@ EOF
     grep -A3 "restart: always" "$COMPOSE_FILE" | \
         while IFS= read -r line; do log "  $line"; done
 
+    # --- Валидация YAML перед перезапуском ---
+    if ! docker compose -f "$COMPOSE_FILE" config > /dev/null 2>&1; then
+        log "❌ YAML невалиден, восстанавливаем бэкап"
+        cp "$BACKUP" "$COMPOSE_FILE"
+        return 1
+    fi
+    log "✅ YAML валиден"
+
     # --- Перезапускаем контейнер ---
     log "Перезапускаем remnanode..."
     cd /opt/remnanode || { log "❌ Не удалось перейти в /opt/remnanode"; return 1; }
@@ -776,7 +794,7 @@ EOF
         log "✅ remnanode запущен"
         docker ps | grep remnanode | while IFS= read -r line; do log "  $line"; done
     else
-        log "❌ remnanode не запустился, проверь docker logs remnanode"
+        log "❌ remnanode не запустился, проверь: docker logs remnanode"
     fi
 
     log "=== ✅ NET_ADMIN установлен ==="
