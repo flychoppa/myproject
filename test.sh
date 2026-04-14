@@ -60,7 +60,7 @@ disable_ipv6() {
     log "✅ IPv6 отключен (нужен reboot)"
 }
 
-----2------
+#----2------
 setup_certbot_nginx() {
     log "=== 2. Certbot + Nginx ==="
 
