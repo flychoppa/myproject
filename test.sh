@@ -60,7 +60,7 @@ disable_ipv6() {
     log "✅ IPv6 отключен (нужен reboot)"
 }
 
-# --- 2 ---
+----2------
 setup_certbot_nginx() {
     log "=== 2. Certbot + Nginx ==="
 
@@ -73,10 +73,7 @@ setup_certbot_nginx() {
 
     # --- INSTALL CERTBOT + NGINX ---
     apt update -y
-    apt install -y certbot python3-certbot-nginx nginx
-
-    # --- STOP NGINX перед standalone ---
-    systemctl stop nginx 2>/dev/null || true
+    apt install -y certbot python3-certbot-dns-cloudflare nginx
 
     # --- DOMAIN ---
     read -r -p "Введите домен: " domain
@@ -85,17 +82,40 @@ setup_certbot_nginx() {
         return
     fi
 
-    # --- SSL ---
-    certbot certonly --standalone -d "$domain" \
+    # --- CLOUDFLARE API TOKEN ---
+    read -r -p "Введите Cloudflare API Token: " cf_token
+    if [[ -z "$cf_token" ]]; then
+        log "❌ API Token не введен"
+        return
+    fi
+
+    # --- СОХРАНЯЕМ CREDENTIALS ---
+    mkdir -p /root/.secrets
+    cat > /root/.secrets/cloudflare.ini <<EOF
+dns_cloudflare_api_token = $cf_token
+EOF
+    chmod 600 /root/.secrets/cloudflare.ini
+
+    # --- SSL через DNS-01 (A записи не трогаем) ---
+    log "Выпускаем сертификат через Cloudflare DNS..."
+    certbot certonly \
+        --dns-cloudflare \
+        --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
+        --dns-cloudflare-propagation-seconds 30 \
+        -d "$domain" \
         --non-interactive --agree-tos --email "admin@$domain"
+
+    if [[ $? -ne 0 ]]; then
+        log "❌ Ошибка выпуска сертификата"
+        return
+    fi
 
     # --- START NGINX ---
     systemctl start nginx
     systemctl enable nginx
 
-    # --- CONFIG ---
+    # --- CONFIG NGINX ---
     log "Записываем конфиг nginx..."
-
     cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 127.0.0.1:8443 ssl http2 proxy_protocol;
@@ -105,30 +125,14 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-
-    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
-    ssl_session_cache shared:SSL:1m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-
-    real_ip_header proxy_protocol;
-    set_real_ip_from 127.0.0.1;
-    set_real_ip_from ::1;
-
-    root /var/www/site;
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
 }
 EOF
 
-    nginx -t
-    systemctl restart nginx
+    nginx -t && systemctl reload nginx
 
-    log "✅ Certbot + Nginx готово"
+    log "✅ Certbot + Nginx готово. Сертификат: /etc/letsencrypt/live/$domain/"
 }
 
 # --- 3 ---
