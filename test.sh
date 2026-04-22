@@ -135,134 +135,6 @@ EOF
     log "✅ Certbot + Nginx готово. Сертификат: /etc/letsencrypt/live/$domain/"
 }
 
-# --- 3 ---
-setup_device_guard() {
-    log "=== 3. Device Guard (Remnanode → Telegram Bot) ==="
-
-    local BOT_DOMAIN="bots.snowfall.top"
-    local TIME_WINDOW=15
-    local INSTALL_DIR="/opt/device-guard"
-    local SCRIPT_PATH="${INSTALL_DIR}/report.sh"
-    local REMNANODE_LOG_FILE="/var/log/remnanode/access.log"
-    local DOCKER_COMPOSE_FILE="/opt/remnanode/docker-compose.yml"
-
-    # --- Шаг 1: Зависимости ---
-    log "Шаг 1/5: Установка зависимостей (cron, curl, gawk)..."
-    apt-get update -qq
-    apt-get install -y cron curl gawk >/dev/null 2>&1
-    systemctl enable cron >/dev/null 2>&1 || true
-    systemctl start cron >/dev/null 2>&1 || true
-    log "✅ Зависимости готовы"
-
-    # --- Шаг 2: Извлечение SECRET_KEY ---
-    log "Шаг 2/5: Поиск SECRET_KEY в ${DOCKER_COMPOSE_FILE}..."
-
-    if [[ ! -f "$DOCKER_COMPOSE_FILE" ]]; then
-        log "❌ Файл ${DOCKER_COMPOSE_FILE} не найден. Убедитесь, что remnanode установлен в /opt/remnanode/"
-        return 1
-    fi
-
-    local SECRET_KEY
-    SECRET_KEY="$(grep -E 'SECRET_KEY=' "$DOCKER_COMPOSE_FILE" | head -1 | sed -E 's/.*SECRET_KEY=([^"'\''[:space:]]+).*/\1/' | tr -d '\r')"
-
-    if [[ -z "$SECRET_KEY" ]]; then
-        log "❌ SECRET_KEY не найден в ${DOCKER_COMPOSE_FILE}"
-        return 1
-    fi
-
-    log "✅ SECRET_KEY извлечён (${#SECRET_KEY} символов)"
-
-    # --- Шаг 3: Создание директорий ---
-    log "Шаг 3/5: Создание директорий..."
-    mkdir -p "$INSTALL_DIR"
-    mkdir -p /var/log/remnanode
-    touch "$REMNANODE_LOG_FILE"
-    chmod 644 "$REMNANODE_LOG_FILE"
-    chmod -R 777 /var/log/remnanode/
-    log "✅ Директории готовы"
-
-    # --- Шаг 4: Генерация report.sh ---
-    log "Шаг 4/5: Генерация ${SCRIPT_PATH}..."
-
-    cat > "$SCRIPT_PATH" <<EOFSCRIPT
-#!/bin/bash
-# === НАСТРОЙКИ ===
-WEBHOOKS=(
-  "https://${BOT_DOMAIN}/device-report|${SECRET_KEY}"
-)
-TIME_WINDOW=${TIME_WINDOW}
-LOG_FILE="${REMNANODE_LOG_FILE}"
-
-DATA=\$(tail -n 10000 "\$LOG_FILE" 2>/dev/null | \
-  awk -v window="\$TIME_WINDOW" '
-  /email:/ {
-    split(\$1, d, "/")
-    split(\$2, t, ":")
-    split(t[3], sec, ".")
-    ts = mktime(d[1] " " d[2] " " d[3] " " t[1] " " t[2] " " sec[1])
-    match(\$0, /from ([0-9.]+):/, iparr)
-    match(\$0, /email: ([0-9]+)/, emarr)
-    if(iparr[1] && emarr[1]) {
-      n = ++total
-      all_ts[n] = ts
-      all_ip[n] = iparr[1]
-      all_em[n] = emarr[1]
-      if (ts > global_max) global_max = ts
-    }
-  }
-  END {
-    threshold = global_max - window
-    for (i = 1; i <= total; i++) {
-      if (all_ts[i] >= threshold) {
-        em = all_em[i]
-        ip = all_ip[i]
-        key = em SUBSEP ip
-        if (!(key in seen)) {
-          seen[key] = 1
-          users[em] = users[em] ? users[em] ",\"" ip "\"" : "\"" ip "\""
-        }
-      }
-    }
-    printf "{\"ts\":%d,\"users\":{", systime()
-    first = 1
-    for (em in users) {
-      if (!first) printf ","
-      printf "\"%s\":[%s]", em, users[em]
-      first = 0
-    }
-    print "}}"
-  }')
-
-for entry in "\${WEBHOOKS[@]}"; do
-  URL="\${entry%%|*}"
-  KEY="\${entry##*|}"
-  echo "\$DATA" | curl -s -X POST "\$URL" \
-    -H "Content-Type: application/json" \
-    -H "X-Api-Key: \$KEY" \
-    -d @- > /dev/null 2>&1 &
-done
-
-wait
-EOFSCRIPT
-
-    chmod +x "$SCRIPT_PATH"
-    log "✅ Скрипт создан: $SCRIPT_PATH"
-
-    # --- Шаг 5: Cron ---
-    log "Шаг 5/5: Настройка cron (каждые 2 минуты)..."
-    local CRON_JOB="*/2 * * * * $SCRIPT_PATH"
-    (
-        crontab -l 2>/dev/null | grep -F -v "$SCRIPT_PATH" || true
-        echo "$CRON_JOB"
-    ) | crontab -
-    log "✅ Cron добавлен: $CRON_JOB"
-
-    log "=== ✅ Device Guard установлен ==="
-    log "Скрипт:   $SCRIPT_PATH"
-    log "Лог:      $REMNANODE_LOG_FILE"
-    log "Проверка: crontab -l | grep device-guard"
-}
-
 # --- 5 ---
 setup_vpn_limits() {
     log "=== 5. VPN Limits (conntrack, sysctl, ulimit, systemd) ==="
@@ -707,102 +579,6 @@ EOF
     log "⚠️  Сервер будет полностью перезагружаться каждое воскресенье в 04:00 МСК"
 }
 
-# --- 8 ---
-setup_net_admin() {
-    log "=== 8. NET_ADMIN: добавляем cap_add в remnanode ==="
-
-    local COMPOSE_FILE="/opt/remnanode/docker-compose.yml"
-
-    # --- Проверяем файл ---
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        log "❌ Файл не найден: $COMPOSE_FILE"
-        return 1
-    fi
-
-    # --- Уже есть? ---
-    if grep -q "NET_ADMIN" "$COMPOSE_FILE"; then
-        log "✅ NET_ADMIN уже присутствует, ничего не меняем"
-        return 0
-    fi
-
-    # --- Бэкап ---
-    local BACKUP="${COMPOSE_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$COMPOSE_FILE" "$BACKUP"
-    log "📦 Бэкап создан: $BACKUP"
-
-    # --- Вставляем cap_add с правильным отступом ---
-    python3 - << EOF
-import re, sys
-
-with open('$COMPOSE_FILE', 'r') as f:
-    content = f.read()
-
-# Определяем реальный отступ строки restart: always
-match = re.search(r'^([ \t]*)restart:\s*always', content, re.MULTILINE)
-if not match:
-    print("❌ Строка 'restart: always' не найдена, файл не изменён")
-    sys.exit(1)
-
-indent = match.group(1)
-
-# Вставляем с тем же отступом что и restart: always
-insert = f"{indent}cap_add:\n{indent}  - NET_ADMIN\n"
-
-new_content = re.sub(
-    r'([ \t]*restart:\s*always\n)',
-    r'\1' + insert,
-    content,
-    count=1
-)
-
-if new_content == content:
-    print("❌ Не удалось вставить, файл не изменён")
-    sys.exit(1)
-
-with open('$COMPOSE_FILE', 'w') as f:
-    f.write(new_content)
-
-print("✅ cap_add: NET_ADMIN добавлен")
-EOF
-
-    # Проверяем что python3 отработал успешно
-    if [[ $? -ne 0 ]]; then
-        log "❌ Ошибка при изменении файла, восстанавливаем бэкап"
-        cp "$BACKUP" "$COMPOSE_FILE"
-        return 1
-    fi
-
-    # --- Показываем результат ---
-    log "Результат вставки:"
-    grep -A3 "restart: always" "$COMPOSE_FILE" | \
-        while IFS= read -r line; do log "  $line"; done
-
-    # --- Валидация YAML перед перезапуском ---
-    if ! docker compose -f "$COMPOSE_FILE" config > /dev/null 2>&1; then
-        log "❌ YAML невалиден, восстанавливаем бэкап"
-        cp "$BACKUP" "$COMPOSE_FILE"
-        return 1
-    fi
-    log "✅ YAML валиден"
-
-    # --- Перезапускаем контейнер ---
-    log "Перезапускаем remnanode..."
-    cd /opt/remnanode || { log "❌ Не удалось перейти в /opt/remnanode"; return 1; }
-
-    docker compose down 2>&1 | tail -3 | while IFS= read -r line; do log "  $line"; done
-    docker compose up -d 2>&1 | tail -3 | while IFS= read -r line; do log "  $line"; done
-
-    # --- Проверяем что поднялся ---
-    sleep 3
-    if docker ps | grep -q remnanode; then
-        log "✅ remnanode запущен"
-        docker ps | grep remnanode | while IFS= read -r line; do log "  $line"; done
-    else
-        log "❌ remnanode не запустился, проверь: docker logs remnanode"
-    fi
-
-    log "=== ✅ NET_ADMIN установлен ==="
-}
 # --- MENU ---
 main_menu() {
     check_root
@@ -812,24 +588,20 @@ main_menu() {
         echo ""
         echo "1) Отключить IPv6"
         echo "2) Certbot + Nginx"
-        echo "3) Device Guard"
-        echo "4) UFW + Node Exporter"
-        echo "5) VPN Limits (conntrack / sysctl / ulimit)"
-        echo "6) VPN Net Optimizer (RPS/RFS/XPS/IRQ/BBR)"
-        echo "7) Cron: еженедельный перезапуск VPN (04:00 МСК)"
-        echo "8) NET_ADMIN: cap_add для remnanode"
+        echo "3) UFW + Node Exporter"
+        echo "4) VPN Limits (conntrack / sysctl / ulimit)"
+        echo "5) VPN Net Optimizer (RPS/RFS/XPS/IRQ/BBR)"
+        echo "6) Cron: еженедельный перезапуск VPN (04:00 МСК)"
         echo "0) Выход"
         read -r -p "Выбор: " choice || true
 
         case "$choice" in
             1) disable_ipv6 ;;
             2) setup_certbot_nginx ;;
-            3) setup_device_guard ;;
-            4) setup_ufw ;;
-            5) setup_vpn_limits ;;
-            6) setup_net_optimizer ;;
-            7) setup_cron_restart ;;
-            8) setup_net_admin ;;
+            3) setup_ufw ;;
+            4) setup_vpn_limits ;;
+            5) setup_net_optimizer ;;
+            6) setup_cron_restart ;;
             0) exit 0 ;;
             *) log "❌ Неверный пункт" ;;
         esac
