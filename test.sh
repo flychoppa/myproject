@@ -295,11 +295,13 @@ PYEOF
 }
 
 # --- 6 ---
-# --- 6 ---
 setup_net_optimizer() {
     log "=== 6. VPN Net Optimizer (Queues/RingBuf/RPS/RFS/XPS/IRQ/Offload/BBR) ==="
 
     local DEV NUM_CPU RX_QUEUES TX_QUEUES SERVER_TYPE CPU_MASK IRQ_SPREAD
+    local COMBINED_MAX TX_Q_MAX COMBINED_CUR OPT_Q
+    local RX_MAX TX_RB_MAX RX_CUR TX_RB_CUR
+    local DRIVER FLOW_CNT
 
     DEV=$(ip -o route show default | awk '{print $5}' | head -n1)
     [[ -z "$DEV" ]] && { log "❌ Не найден сетевой интерфейс"; return; }
@@ -314,8 +316,6 @@ setup_net_optimizer() {
     RX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/rx-* 2>/dev/null | wc -l)
     TX_QUEUES=$(ls -d /sys/class/net/$DEV/queues/tx-* 2>/dev/null | wc -l)
     SERVER_TYPE=$([[ $RX_QUEUES -gt 1 ]] && echo "dedicated" || echo "vps")
-
-    local DRIVER
     DRIVER=$(ethtool -i "$DEV" 2>/dev/null | awk '/driver:/ {print $2}')
 
     CPU_MASK=$(python3 -c "
@@ -335,20 +335,19 @@ print(format(mask, 'x'))
 
     log "Интерфейс: $DEV | Драйвер: $DRIVER | Тип: $SERVER_TYPE | CPU: $NUM_CPU | RX: $RX_QUEUES | TX: $TX_QUEUES | IRQ активных: $IRQ_SPREAD"
 
-    # --- Очереди (Combined / TX) ---
+    # --- Шаг 1: Очереди (Combined / TX) ---
     log "Шаг 1/6: Очереди..."
-    local COMBINED_MAX TX_Q_MAX COMBINED_CUR
-    COMBINED_MAX=$(ethtool -l "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/Combined:/) {print $2; exit}}')
-    TX_Q_MAX=$(ethtool -l "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/TX:/) {print $2; exit}}')
-    COMBINED_CUR=$(ethtool -l "$DEV" 2>/dev/null | awk '/Current hardware settings/,0 {if (/Combined:/) {print $2; exit}}')
+    COMBINED_MAX=$(ethtool -l "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/Combined:/) {print $2; exit}}') || true
+    TX_Q_MAX=$(ethtool -l "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/TX:/) {print $2; exit}}') || true
+    COMBINED_CUR=$(ethtool -l "$DEV" 2>/dev/null | awk '/Current hardware settings/,0 {if (/Combined:/) {print $2; exit}}') || true
 
     if [[ -n "$COMBINED_MAX" && "$COMBINED_MAX" =~ ^[0-9]+$ && "$COMBINED_MAX" -gt 1 ]]; then
-        local OPT_Q=$(( NUM_CPU < COMBINED_MAX ? NUM_CPU : COMBINED_MAX ))
+        OPT_Q=$(( NUM_CPU < COMBINED_MAX ? NUM_CPU : COMBINED_MAX ))
         ethtool -L "$DEV" combined "$OPT_Q" 2>/dev/null \
             && log "✅ Combined очереди: $COMBINED_CUR → $OPT_Q" \
             || log "⚠️ Combined не применилось"
     elif [[ -n "$TX_Q_MAX" && "$TX_Q_MAX" =~ ^[0-9]+$ && "$TX_Q_MAX" -gt 1 ]]; then
-        local OPT_Q=$(( NUM_CPU < TX_Q_MAX ? NUM_CPU : TX_Q_MAX ))
+        OPT_Q=$(( NUM_CPU < TX_Q_MAX ? NUM_CPU : TX_Q_MAX ))
         ethtool -L "$DEV" tx "$OPT_Q" 2>/dev/null \
             && log "✅ TX очереди → $OPT_Q" \
             || log "⚠️ TX не применилось"
@@ -356,13 +355,12 @@ print(format(mask, 'x'))
         log "⚠️ Очереди: драйвер не поддерживает изменение (фиксированы железом)"
     fi
 
-    # --- Ring buffer ---
+    # --- Шаг 2: Ring buffer ---
     log "Шаг 2/6: Ring buffer..."
-    local RX_MAX TX_RB_MAX RX_CUR TX_RB_CUR
-    RX_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/RX:/) {print $2; exit}}')
-    TX_RB_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/TX:/) {print $2; exit}}')
-    RX_CUR=$(ethtool -g "$DEV" 2>/dev/null | awk '/Current hardware settings/,0 {if (/RX:/) {print $2; exit}}')
-    TX_RB_CUR=$(ethtool -g "$DEV" 2>/dev/null | awk '/Current hardware settings/,0 {if (/TX:/) {print $2; exit}}')
+    RX_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/RX:/) {print $2; exit}}') || true
+    TX_RB_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/TX:/) {print $2; exit}}') || true
+    RX_CUR=$(ethtool -g "$DEV" 2>/dev/null | awk '/Current hardware settings/,0 {if (/RX:/) {print $2; exit}}') || true
+    TX_RB_CUR=$(ethtool -g "$DEV" 2>/dev/null | awk '/Current hardware settings/,0 {if (/TX:/) {print $2; exit}}') || true
 
     if [[ -n "$RX_MAX" && "$RX_MAX" =~ ^[0-9]+$ ]]; then
         ethtool -G "$DEV" rx "$RX_MAX" tx "$TX_RB_MAX" 2>/dev/null \
@@ -372,14 +370,14 @@ print(format(mask, 'x'))
         log "⚠️ Ring buffer не поддерживается"
     fi
 
-    # --- Offload ---
+    # --- Шаг 3: Offload ---
     log "Шаг 3/6: Offload..."
     ethtool -K "$DEV" gro on  2>/dev/null && log "✅ GRO: on"  || log "⚠️ GRO не поддерживается"
     ethtool -K "$DEV" gso on  2>/dev/null && log "✅ GSO: on"  || log "⚠️ GSO не поддерживается"
     ethtool -K "$DEV" tso on  2>/dev/null && log "✅ TSO: on"  || log "⚠️ TSO не поддерживается"
     ethtool -K "$DEV" lro off 2>/dev/null && log "✅ LRO: off (важно для VPN)" || true
 
-    # --- RPS/RFS ---
+    # --- Шаг 4: RPS/RFS ---
     log "Шаг 4/6: RPS/RFS..."
     if [[ $RX_QUEUES -le 1 ]] || [[ $IRQ_SPREAD -le 2 ]]; then
         [[ $RX_QUEUES -le 1 ]] \
@@ -389,7 +387,6 @@ print(format(mask, 'x'))
             printf "%s\n" "$CPU_MASK" > "$q/rps_cpus"
         done
         echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
-        local FLOW_CNT
         FLOW_CNT=$(python3 -c "
 n = 32768 // $RX_QUEUES
 p = 1
@@ -403,15 +400,15 @@ print(p)")
         log "⚠️ RPS/RFS пропущен — $RX_QUEUES очередей, IRQ уже на $IRQ_SPREAD CPU"
     fi
 
-    # --- XPS ---
+    # --- Шаг 5: XPS ---
     log "Шаг 5/6: XPS..."
     if [[ $TX_QUEUES -gt 1 ]]; then
         local QID=0
         for q in /sys/class/net/$DEV/queues/tx-*; do
-            local CPU=$(( QID % NUM_CPU ))
-            local MASK
-            MASK=$(python3 -c "print(format(1 << $CPU, 'x'))")
-            printf "%s\n" "$MASK" > "$q/xps_cpus" 2>/dev/null || true
+            local CPU_XPS MASK_XPS
+            CPU_XPS=$(( QID % NUM_CPU ))
+            MASK_XPS=$(python3 -c "print(format(1 << $CPU_XPS, 'x'))")
+            printf "%s\n" "$MASK_XPS" > "$q/xps_cpus" 2>/dev/null || true
             QID=$(( QID + 1 ))
         done
         log "✅ XPS применён ($TX_QUEUES TX очередей, round-robin по $NUM_CPU CPU)"
@@ -419,7 +416,7 @@ print(p)")
         log "⚠️ XPS пропущен — только 1 TX очередь"
     fi
 
-    # --- IRQ ---
+    # --- Шаг 6: IRQ ---
     log "Шаг 6/6: IRQ affinity..."
     safe_run apt-get install -y irqbalance -qq
     if [[ "$SERVER_TYPE" == "vps" ]]; then
@@ -430,7 +427,7 @@ print(p)")
         systemctl disable irqbalance 2>/dev/null || true
         log "✅ irqbalance отключён (dedicated)"
 
-        local QID=0
+        local QID_IRQ=0
         local IRQS=""
 
         IRQS=$(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
@@ -443,18 +440,19 @@ print(p)")
 
         if [[ -n "$IRQS" ]]; then
             for IRQ in $IRQS; do
-                local CPU=$(( QID % NUM_CPU ))
-                echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
-                    > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
-                QID=$(( QID + 1 ))
+                local CPU_IRQ MASK_IRQ
+                CPU_IRQ=$(( QID_IRQ % NUM_CPU ))
+                MASK_IRQ=$(python3 -c "print(format(1 << $CPU_IRQ, 'x'))")
+                echo "$MASK_IRQ" > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
+                QID_IRQ=$(( QID_IRQ + 1 ))
             done
-            log "✅ IRQ привязаны вручную ($QID очередей → $NUM_CPU CPU)"
+            log "✅ IRQ привязаны вручную ($QID_IRQ очередей → $NUM_CPU CPU)"
         else
             log "⚠️ IRQ не найдены — гипервизор управляет сам"
         fi
     fi
 
-    # --- BBR (если не применён в пункте 5) ---
+    # --- BBR ---
     if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
         modprobe tcp_bbr 2>/dev/null || true
         grep -q tcp_bbr /etc/modules-load.d/bbr.conf 2>/dev/null || \
@@ -494,15 +492,15 @@ IRQ_SPREAD=$(grep -E "${DEV}|virtio" /proc/interrupts 2>/dev/null | \
     awk '{for(i=2;i<=NF-3;i++) if($i+0>1000) count++} END{print count+0}')
 
 # Очереди Combined
-COMBINED_MAX=$(ethtool -l "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/Combined:/) {print $2; exit}}')
+COMBINED_MAX=$(ethtool -l "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/Combined:/) {print $2; exit}}') || true
 if [[ -n "$COMBINED_MAX" && "$COMBINED_MAX" =~ ^[0-9]+$ && "$COMBINED_MAX" -gt 1 ]]; then
     OPT_Q=$(( NUM_CPU < COMBINED_MAX ? NUM_CPU : COMBINED_MAX ))
     ethtool -L "$DEV" combined "$OPT_Q" 2>/dev/null || true
 fi
 
 # Ring buffer
-RX_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/RX:/) {print $2; exit}}')
-TX_RB_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/TX:/) {print $2; exit}}')
+RX_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/RX:/) {print $2; exit}}') || true
+TX_RB_MAX=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums/,/Current hardware settings/ {if (/TX:/) {print $2; exit}}') || true
 if [[ -n "$RX_MAX" && "$RX_MAX" =~ ^[0-9]+$ ]]; then
     ethtool -G "$DEV" rx "$RX_MAX" tx "$TX_RB_MAX" 2>/dev/null || true
 fi
@@ -530,16 +528,16 @@ fi
 if [[ $TX_QUEUES -gt 1 ]]; then
     QID=0
     for q in /sys/class/net/$DEV/queues/tx-*; do
-        CPU=$(( QID % NUM_CPU ))
-        MASK=$(python3 -c "print(format(1 << $CPU, 'x'))")
-        echo "$MASK" > "$q/xps_cpus" 2>/dev/null || true
+        CPU_XPS=$(( QID % NUM_CPU ))
+        MASK_XPS=$(python3 -c "print(format(1 << $CPU_XPS, 'x'))")
+        echo "$MASK_XPS" > "$q/xps_cpus" 2>/dev/null || true
         QID=$(( QID + 1 ))
     done
 fi
 
 # IRQ affinity — только dedicated
 if [[ $RX_QUEUES -gt 1 ]]; then
-    QID=0
+    QID_IRQ=0
     IRQS=$(grep -E "${DEV}(-|$|[0-9])" /proc/interrupts 2>/dev/null \
            | awk -F: '{print $1}' | tr -d ' ' || true)
     if [[ -z "$IRQS" ]]; then
@@ -548,10 +546,10 @@ if [[ $RX_QUEUES -gt 1 ]]; then
     fi
     if [[ -n "$IRQS" ]]; then
         for IRQ in $IRQS; do
-            CPU=$(( QID % NUM_CPU ))
-            echo "$(python3 -c "print(format(1 << $CPU, 'x'))")" \
-                > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
-            QID=$(( QID + 1 ))
+            CPU_IRQ=$(( QID_IRQ % NUM_CPU ))
+            MASK_IRQ=$(python3 -c "print(format(1 << $CPU_IRQ, 'x'))")
+            echo "$MASK_IRQ" > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
+            QID_IRQ=$(( QID_IRQ + 1 ))
         done
     fi
 fi
@@ -581,6 +579,7 @@ UNIT
     log "Сервис    : vpn-netopt.service (автозапуск при ребуте)"
     log "Скрипт    : /usr/local/sbin/vpn-netopt.sh"
 }
+
 
     # --- 7 ---
 setup_cron_restart() {
